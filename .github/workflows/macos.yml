@@ -1,4 +1,4 @@
-name: Build SSD+VR Fusion Viewer DMG (macOS)
+name: Build SSD+VR for macOS (DMG + App)
 
 on:
   push:
@@ -10,26 +10,17 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@v3
+      - uses: conda-incubator/setup-miniconda@v3
         with:
           python-version: "3.10"
           channels: conda-forge,defaults
 
-      - name: Cache conda
-        uses: actions/cache@v4
-        with:
-          path: ~/conda_pkgs_dir
-          key: ${{ runner.os }}-conda-${{ hashFiles('requirements.txt') }}
-          restore-keys: ${{ runner.os }}-conda-
-
       - name: Install system deps
         run: brew install create-dmg
 
-      - name: Install Python packages (conda)
+      - name: Install Python deps
         shell: bash -el {0}
         run: |
           conda install -y numpy scipy matplotlib
@@ -37,65 +28,65 @@ jobs:
           pip install PySide6 PyCt6 nibabel scikit-image SimpleITK
           pip install pyinstaller
 
-      - name: Build .app bundle
+      - name: Bundle Qt plugins path
+        shell: bash -el {0}
+        id: qtpath
+        run: |
+          QP=$(python -c "import PySide6; print(PySide6.__path__[0])")
+          echo "qtplugins=$QP/Qt/plugins" >> $GITHUB_OUTPUT
+
+      - name: Build .app
         shell: bash -el {0}
         run: |
           pyinstaller --onedir --windowed \
-            --name="SSD_VR_Fusion_Viewer" \
-            --icon="logo.jpg" \
-            --add-data="scientific.json:." \
-            --add-data="dark.qss:." \
-            --add-data="presets.xml:." \
-            --add-data="logo.jpg:." \
-            --add-data="segmentation:segmentation" \
-            --collect-all=PySide6 \
-            --collect-binaries=PySide6 \
-            --collect-all=PyCt6 \
-            --collect-submodules=PyCt6 \
-            --collect-data=PyCt6 \
-            --collect-all=vtkmodules \
-            --collect-all=vtk \
-            --collect-all=SimpleITK \
-            --hidden-import=PyCt6 \
-            --hidden-import=PyCt6.widgets.c_button \
-            --hidden-import=PyCt6.widgets.c_label \
-            --hidden-import=PyCt6.widgets.c_line_edit \
-            --hidden-import=PyCt6.widgets.c_combo_box \
-            --hidden-import=PyCt6.widgets.c_slider \
-            --hidden-import=PyCt6.widgets.c_frame \
-            --hidden-import=PyCt6.widgets.c_text_edit \
-            --hidden-import=PyCt6.windows.c_main_window \
-            --hidden-import=PyCt6.windows.c_toplevel \
-            --hidden-import=PyCt6.appearance.theme_manager \
-            --hidden-import=PyCt6.appearance.mode_manager \
-            --hidden-import=PySide6.QtCore \
-            --hidden-import=PySide6.QtGui \
-            --hidden-import=PySide6.QtWidgets \
-            --hidden-import=PySide6.QtOpenGL \
-            --hidden-import=PySide6.QtOpenGLWidgets \
-            --hidden-import=PySide6.QtSvg \
-            --hidden-import=PySide6.QtSvgWidgets \
-            --hidden-import=vtkmodules.qt.QVTKRenderWindowInteractor \
-            --hidden-import=vtkmodules.util.numpy_support \
-            --hidden-import=vtkRenderingOpenGL2 \
-            --hidden-import=vtkRenderingVolumeOpenGL2 \
-            --hidden-import=scipy.ndimage \
-            --hidden-import=skimage.restoration \
-            --hidden-import=skimage.filters \
-            --hidden-import=nibabel \
-            --hidden-import=nibabel.nifti1 \
-            --exclude-module=tkinter \
-            --osx-bundle-identifier=com.ssdvr.fusion-viewer \
+            --name "SSD_VR_Fusion_Viewer" \
+            --icon "logo.jpg" \
+            --add-data "scientific.json:." \
+            --add-data "dark.qss:." \
+            --add-data "presets.xml:." \
+            --add-data "logo.jpg:." \
+            --add-data "segmentation:segmentation" \
+            --add-data "${{ steps.qtpath.outputs.qtplugins }}/platforms:Qt/plugins/platforms" \
+            --add-data "${{ steps.qtpath.outputs.qtplugins }}/imageformats:Qt/plugins/imageformats" \
+            --add-data "${{ steps.qtpath.outputs.qtplugins }}/styles:Qt/plugins/styles" \
+            --collect-all PyCt6 \
+            --collect-submodules PyCt6 \
+            --collect-data PyCt6 \
+            --collect-all vtkmodules \
+            --collect-all vtk \
+            --collect-all SimpleITK \
+            --hidden-import PyCt6 \
+            --hidden-import PyCt6.widgets.c_button \
+            --hidden-import PyCt6.widgets.c_label \
+            --hidden-import PyCt6.widgets.c_line_edit \
+            --hidden-import PyCt6.widgets.c_combo_box \
+            --hidden-import PyCt6.widgets.c_slider \
+            --hidden-import PyCt6.widgets.c_frame \
+            --hidden-import PyCt6.widgets.c_text_edit \
+            --hidden-import PyCt6.windows.c_main_window \
+            --hidden-import PyCt6.windows.c_toplevel \
+            --hidden-import PyCt6.appearance.theme_manager \
+            --hidden-import PyCt6.appearance.mode_manager \
+            --hidden-import PySide6.QtCore \
+            --hidden-import PySide6.QtGui \
+            --hidden-import PySide6.QtWidgets \
+            --hidden-import PySide6.QtOpenGL \
+            --hidden-import PySide6.QtOpenGLWidgets \
+            --hidden-import PySide6.QtSvg \
+            --hidden-import vtkmodules.qt.QVTKRenderWindowInteractor \
+            --hidden-import vtkmodules.util.numpy_support \
+            --hidden-import vtkRenderingOpenGL2 \
+            --hidden-import vtkRenderingVolumeOpenGL2 \
+            --hidden-import scipy.ndimage \
+            --hidden-import skimage.restoration \
+            --hidden-import skimage.filters \
+            --hidden-import nibabel \
+            --hidden-import nibabel.nifti1 \
+            --exclude-module tkinter \
+            --osx-bundle-identifier com.ssdvr.fusion-viewer \
             ssd_vr_viewer.py
 
-      - name: Verify .app runs (smoke test)
-        shell: bash -el {0}
-        run: |
-          timeout 10 "dist/SSD_VR_Fusion_Viewer.app/Contents/MacOS/SSD_VR_Fusion_Viewer" 2>&1 || true
-          echo "Smoke test completed (exit expected after timeout)"
-
       - name: Package DMG
-        shell: bash -el {0}
         run: |
           create-dmg \
             --volname "SSD_VR_Fusion_Viewer" \
@@ -107,19 +98,19 @@ jobs:
             "dist/SSD_VR_Fusion_Viewer.dmg" \
             "dist/SSD_VR_Fusion_Viewer.app"
 
-      - name: Upload DMG artifact
+      - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
           name: SSD_VR_Fusion_Viewer_macOS
           path: dist/SSD_VR_Fusion_Viewer.dmg
 
-      - name: Upload .app artifact
+      - name: Upload .app
         uses: actions/upload-artifact@v4
         with:
           name: SSD_VR_Fusion_Viewer_app
           path: dist/SSD_VR_Fusion_Viewer.app
 
-      - name: Create Release (tag only)
+      - name: Release (tag only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
