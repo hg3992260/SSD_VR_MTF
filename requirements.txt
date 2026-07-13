@@ -1,0 +1,22 @@
+# Core
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Medical imaging
+SimpleITK>=2.2.0
+nibabel>=5.0.0
+
+# Rendering (ParaView / pvpython required)
+vtk>=9.2.0
+PySide6>=6.5.0
+PyCt6>=6.1.0
+
+# Image processing
+scikit-image>=0.20.0
+matplotlib>=3.7.0
+
+# GPU (optional)
+cupy-cuda12x>=12.0.0
+
+# Segmentation (optional)
+# nnU-Net and SAM-Med3D dependencies — see frame/ subdirectories
