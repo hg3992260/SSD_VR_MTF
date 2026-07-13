@@ -1,193 +1,61 @@
-# ============================================================
-# SSD+VR Fusion Viewer — 独立 EXE 编译配置
-# 工具: PyInstaller 6.x
-# 命令: pyinstaller build.yaml
-# 或手动: pyinstaller --distpath=./dist --workpath=./build ssd_vr_viewer.spec
-# ============================================================
+name: Build SSD+VR Fusion Viewer EXE
 
-app:
-  name: SSD_VR_Fusion_Viewer
-  entry_point: ssd_vr_viewer.py
-  version: "2.0.1"
-  console: false
-  icon: logo.jpg
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
 
-# ============================================================
-# 数据文件 (随 EXE 一起打包)
-# ============================================================
-datas:
-  - { source: scientific.json,   dest: "." }
-  - { source: dark.qss,          dest: "." }
-  - { source: presets.xml,       dest: "." }
-  - { source: logo.jpg,          dest: "." }
-  - { source: segmentation,      dest: "segmentation" }
+jobs:
+  build:
+    runs-on: windows-latest
 
-# ============================================================
-# 二进制依赖 (DLL)
-# ============================================================
-binaries:
-  - { source: exposure-render-master/exposure-render-master/Source/build/Release/ErCore.dll,
-      dest: "." }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-# ============================================================
-# 隐式导入 (PyInstaller 可能遗漏的模块)
-# ============================================================
-hidden_imports:
-  # — PySide6 + PyCt6 —
-  - PySide6.QtCore
-  - PySide6.QtGui
-  - PySide6.QtWidgets
-  - PySide6.QtOpenGL
-  - PySide6.QtOpenGLWidgets
-  - PyCt6
-  - PyCt6.widgets.c_button
-  - PyCt6.widgets.c_label
-  - PyCt6.widgets.c_line_edit
-  - PyCt6.widgets.c_text_edit
-  - PyCt6.widgets.c_combo_box
-  - PyCt6.widgets.c_slider
-  - PyCt6.widgets.c_frame
-  - PyCt6.appearance.theme_manager
-  - PyCt6.appearance.mode_manager
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
 
-  # — VTK —
-  - vtk
-  - vtkmodules
-  - vtkmodules.qt
-  - vtkmodules.qt.QVTKRenderWindowInteractor
-  - vtkmodules.util.numpy_support
-  - vtkmodules.all
-  - vtkRenderingOpenGL2
-  - vtkRenderingVolumeOpenGL2
-  - vtkRenderingUI
-  - vtkInteractionStyle
-  - vtkFiltersSources
-  - vtkIOImage
-  - vtkImagingCore
-  - vtkRenderingCore
-  - vtkCommonCore
-  - vtkCommonDataModel
-  - vtkCommonExecutionModel
-  - vtkFiltersCore
-  - vtkFiltersGeneral
-  - vtkFiltersGeometry
-  - vtkFiltersHybrid
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
 
-  # — 科学计算 —
-  - numpy
-  - numpy.core._methods
-  - numpy.lib.format
-  - scipy
-  - scipy.ndimage
-  - scipy.ndimage._ni_support
-  - scipy.sparse.csgraph._validation
-  - scipy.special._ufuncs_cxx
-  - scipy.linalg.cython_blas
-  - scipy.linalg.cython_lapack
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
 
-  # — 医学影像 —
-  - SimpleITK
-  - nibabel
-  - nibabel.nifti1
-  - nibabel.nifti2
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --noconsole `
+            --name="SSD_VR_Fusion_Viewer" `
+            --icon="logo.jpg" `
+            --add-data="scientific.json;." `
+            --add-data="dark.qss;." `
+            --add-data="presets.xml;." `
+            --add-data="logo.jpg;." `
+            --add-data="segmentation;segmentation" `
+            --add-binary="exposure-render-master/exposure-render-master/Source/build/Release/ErCore.dll;." `
+            --collect-all=PySide6 `
+            --collect-all=vtkmodules `
+            --collect-all=SimpleITK `
+            --hidden-import=PyCt6 `
+            --hidden-import=vtkmodules.qt.QVTKRenderWindowInteractor `
+            --hidden-import=scipy.ndimage `
+            --hidden-import=skimage.restoration `
+            --hidden-import=skimage.filters `
+            --hidden-import=nibabel `
+            --exclude-module=tkinter `
+            ssd_vr_viewer.py
 
-  # — 图像处理 —
-  - skimage
-  - skimage.restoration
-  - skimage.restoration._nl_means_denoising
-  - skimage.exposure
-  - skimage.filters
-  - skimage.filters.ridges
-
-  # — GPU加速 (可选) —
-  - cupy
-  - cupyx
-  - cupyx.scipy.ndimage
-
-  # — 数据格式 —
-  - xml.etree.ElementTree
-  - json
-  - tempfile
-
-  # — 其他 —
-  - matplotlib
-  - matplotlib.backends.backend_agg
-  - PIL
-  - ctypes
-  - argparse
-
-# ============================================================
-# 收集钩子
-# ============================================================
-collects:
-  # PySide6 Qt plugins (platforms, imageformats, etc.)
-  - { name: PySide6,        submodules: [QtCore, QtGui, QtWidgets, QtOpenGL] }
-  # VTK 渲染模块
-  - { name: vtkmodules }
-
-# ============================================================
-# 排除模块 (减小体积)
-# ============================================================
-excludes:
-  - tkinter
-  - unittest
-  - test
-  - pydoc
-  - email
-  - http
-  - html
-  - xmlrpc
-  - pdb
-  - distutils
-  - setuptools
-  - pip
-
-# ============================================================
-# CUDA / GPU 加速配置
-# ============================================================
-gpu:
-  cuda_version: ">=11.8"
-  cudnn_version: ">=8.6"
-  er_core_dll_path: "ErCore.dll"                  # CUDA 路径追踪引擎
-  cupy_available: true                            # CuPy GPU 加速 Frangi
-  vtk_gpu_volume_mapper: true                     # VTK GPU Ray Casting
-  nvidia_driver_required: ">=525"
-
-# ============================================================
-# 运行时环境变量
-# ============================================================
-runtime_env:
-  CUDA_VISIBLE_DEVICES: "0"
-  QT_QPA_PLATFORM: "windows"
-  QT_OPENGL: "desktop"
-
-# ============================================================
-# 编译命令
-# ============================================================
-build_command: >
-  pyinstaller
-    --name="SSD_VR_Fusion_Viewer"
-    --onefile
-    --noconsole
-    --add-data="scientific.json;."
-    --add-data="dark.qss;."
-    --add-data="presets.xml;."
-    --add-data="logo.jpg;."
-    --add-data="segmentation;segmentation"
-    --add-binary="exposure-render-master/exposure-render-master/Source/build/Release/ErCore.dll;."
-    --icon="logo.jpg"
-    --collect-all=PySide6
-    --collect-all=vtkmodules
-    --collect-all=SimpleITK
-    --hidden-import=PyCt6
-    --hidden-import=vtkmodules.qt.QVTKRenderWindowInteractor
-    --hidden-import=vtkmodules.util.numpy_support
-    --hidden-import=scipy.ndimage
-    --hidden-import=skimage.restoration
-    --hidden-import=skimage.exposure
-    --hidden-import=skimage.filters
-    --hidden-import=nibabel
-    --hidden-import=nibabel.nifti1
-    --exclude-module=tkinter
-    --exclude-module=unittest
-    ssd_vr_viewer.py
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSD_VR_Fusion_Viewer
+          path: dist/SSD_VR_Fusion_Viewer.exe
