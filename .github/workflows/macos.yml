@@ -1,0 +1,114 @@
+name: Build SSD+VR Fusion Viewer DMG (macOS)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          brew install create-dmg
+
+      - name: Install Python packages
+        run: |
+          pip install PySide6 PyCt6 numpy scipy matplotlib
+          pip install SimpleITK nibabel scikit-image
+          pip install vtk
+
+      - name: Build .app bundle
+        run: |
+          pyinstaller --onedir --windowed \
+            --name="SSD_VR_Fusion_Viewer" \
+            --icon="logo.jpg" \
+            --add-data="scientific.json:." \
+            --add-data="dark.qss:." \
+            --add-data="presets.xml:." \
+            --add-data="logo.jpg:." \
+            --add-data="segmentation:segmentation" \
+            --collect-all=PySide6 \
+            --collect-all=PyCt6 \
+            --collect-submodules=PyCt6 \
+            --collect-data=PyCt6 \
+            --collect-all=vtkmodules \
+            --collect-all=SimpleITK \
+            --hidden-import=PyCt6 \
+            --hidden-import=PyCt6.widgets \
+            --hidden-import=PyCt6.widgets.c_button \
+            --hidden-import=PyCt6.widgets.c_label \
+            --hidden-import=PyCt6.widgets.c_line_edit \
+            --hidden-import=PyCt6.widgets.c_combo_box \
+            --hidden-import=PyCt6.widgets.c_slider \
+            --hidden-import=PyCt6.widgets.c_frame \
+            --hidden-import=PyCt6.widgets.c_text_edit \
+            --hidden-import=PyCt6.windows \
+            --hidden-import=PyCt6.windows.c_main_window \
+            --hidden-import=PyCt6.windows.c_toplevel \
+            --hidden-import=PyCt6.appearance \
+            --hidden-import=PyCt6.appearance.theme_manager \
+            --hidden-import=PyCt6.appearance.mode_manager \
+            --hidden-import=PySide6.QtSvg \
+            --hidden-import=PySide6.QtSvgWidgets \
+            --hidden-import=vtkmodules.qt.QVTKRenderWindowInteractor \
+            --hidden-import=scipy.ndimage \
+            --hidden-import=skimage.restoration \
+            --hidden-import=skimage.filters \
+            --hidden-import=nibabel \
+            --exclude-module=tkinter \
+            --osx-bundle-identifier=com.ssdvr.fusion-viewer \
+            ssd_vr_viewer.py
+
+      - name: Package DMG
+        run: |
+          create-dmg \
+            --volname "SSD_VR_Fusion_Viewer" \
+            --volicon "logo.jpg" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --app-drop-link 400 150 \
+            "dist/SSD_VR_Fusion_Viewer.dmg" \
+            "dist/SSD_VR_Fusion_Viewer.app"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSD_VR_Fusion_Viewer_macOS
+          path: dist/SSD_VR_Fusion_Viewer.dmg
+
+      - name: Upload .app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSD_VR_Fusion_Viewer_app
+          path: dist/SSD_VR_Fusion_Viewer.app
+
+      - name: Create Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/SSD_VR_Fusion_Viewer.dmg
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
