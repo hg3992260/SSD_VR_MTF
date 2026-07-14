@@ -28,13 +28,6 @@ jobs:
           pip install PySide6 PyCt6 nibabel scikit-image SimpleITK
           pip install pyinstaller
 
-      - name: Bundle Qt plugins path
-        shell: bash -el {0}
-        id: qtpath
-        run: |
-          QP=$(python -c "import PySide6; print(PySide6.__path__[0])")
-          echo "qtplugins=$QP/Qt/plugins" >> $GITHUB_OUTPUT
-
       - name: Build .app
         shell: bash -el {0}
         run: |
@@ -46,9 +39,14 @@ jobs:
             --add-data "presets.xml:." \
             --add-data "logo.jpg:." \
             --add-data "segmentation:segmentation" \
-            --add-data "${{ steps.qtpath.outputs.qtplugins }}/platforms:Qt/plugins/platforms" \
-            --add-data "${{ steps.qtpath.outputs.qtplugins }}/imageformats:Qt/plugins/imageformats" \
-            --add-data "${{ steps.qtpath.outputs.qtplugins }}/styles:Qt/plugins/styles" \
+            --collect-all PySide6 \
+            --exclude-module PySide6.QtWebEngineCore \
+            --exclude-module PySide6.QtWebEngineWidgets \
+            --exclude-module PySide6.QtWebEngineQuick \
+            --exclude-module PySide6.QtQuick \
+            --exclude-module PySide6.QtQuickWidgets \
+            --exclude-module PySide6.QtQml \
+            --exclude-module PySide6.QtQmlModels \
             --collect-all PyCt6 \
             --collect-submodules PyCt6 \
             --collect-data PyCt6 \
@@ -85,6 +83,13 @@ jobs:
             --exclude-module tkinter \
             --osx-bundle-identifier com.ssdvr.fusion-viewer \
             ssd_vr_viewer.py
+
+      - name: Verify Qt plugins bundled
+        shell: bash -el {0}
+        run: |
+          echo "=== Qt Plugins ==="
+          find "dist/SSD_VR_Fusion_Viewer.app" -name "qt.conf" -o -name "libqcocoa*" 2>/dev/null || echo "qt.conf NOT FOUND"
+          ls -la "dist/SSD_VR_Fusion_Viewer.app/Contents/" 2>/dev/null
 
       - name: Package DMG
         run: |
