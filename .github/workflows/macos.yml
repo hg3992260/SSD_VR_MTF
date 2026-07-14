@@ -17,79 +17,25 @@ jobs:
           python-version: "3.10"
           channels: conda-forge,defaults
 
-      - name: Install system deps
-        run: brew install create-dmg
-
-      - name: Install Python deps
+      - name: Install deps
         shell: bash -el {0}
         run: |
           conda install -y numpy scipy matplotlib
           conda install -y -c conda-forge vtk
-          pip install PySide6 PyCt6 nibabel scikit-image SimpleITK
-          pip install pyinstaller
+          pip install PySide6 PyCt6 nibabel scikit-image SimpleITK pyinstaller
+          brew install create-dmg
 
-      - name: Build .app
+      - name: Build .app from spec
+        shell: bash -el {0}
+        run: pyinstaller --clean ssd_vr_viewer_macos.spec
+
+      - name: Verify Qt plugins
         shell: bash -el {0}
         run: |
-          pyinstaller --onedir --windowed \
-            --name "SSD_VR_Fusion_Viewer" \
-            --icon "logo.jpg" \
-            --add-data "scientific.json:." \
-            --add-data "dark.qss:." \
-            --add-data "presets.xml:." \
-            --add-data "logo.jpg:." \
-            --add-data "segmentation:segmentation" \
-            --collect-all PySide6 \
-            --exclude-module PySide6.QtWebEngineCore \
-            --exclude-module PySide6.QtWebEngineWidgets \
-            --exclude-module PySide6.QtWebEngineQuick \
-            --exclude-module PySide6.QtQuick \
-            --exclude-module PySide6.QtQuickWidgets \
-            --exclude-module PySide6.QtQml \
-            --exclude-module PySide6.QtQmlModels \
-            --collect-all PyCt6 \
-            --collect-submodules PyCt6 \
-            --collect-data PyCt6 \
-            --collect-all vtkmodules \
-            --collect-all vtk \
-            --collect-all SimpleITK \
-            --hidden-import PyCt6 \
-            --hidden-import PyCt6.widgets.c_button \
-            --hidden-import PyCt6.widgets.c_label \
-            --hidden-import PyCt6.widgets.c_line_edit \
-            --hidden-import PyCt6.widgets.c_combo_box \
-            --hidden-import PyCt6.widgets.c_slider \
-            --hidden-import PyCt6.widgets.c_frame \
-            --hidden-import PyCt6.widgets.c_text_edit \
-            --hidden-import PyCt6.windows.c_main_window \
-            --hidden-import PyCt6.windows.c_toplevel \
-            --hidden-import PyCt6.appearance.theme_manager \
-            --hidden-import PyCt6.appearance.mode_manager \
-            --hidden-import PySide6.QtCore \
-            --hidden-import PySide6.QtGui \
-            --hidden-import PySide6.QtWidgets \
-            --hidden-import PySide6.QtOpenGL \
-            --hidden-import PySide6.QtOpenGLWidgets \
-            --hidden-import PySide6.QtSvg \
-            --hidden-import vtkmodules.qt.QVTKRenderWindowInteractor \
-            --hidden-import vtkmodules.util.numpy_support \
-            --hidden-import vtkRenderingOpenGL2 \
-            --hidden-import vtkRenderingVolumeOpenGL2 \
-            --hidden-import scipy.ndimage \
-            --hidden-import skimage.restoration \
-            --hidden-import skimage.filters \
-            --hidden-import nibabel \
-            --hidden-import nibabel.nifti1 \
-            --exclude-module tkinter \
-            --osx-bundle-identifier com.ssdvr.fusion-viewer \
-            ssd_vr_viewer.py
-
-      - name: Verify Qt plugins bundled
-        shell: bash -el {0}
-        run: |
-          echo "=== Qt Plugins ==="
-          find "dist/SSD_VR_Fusion_Viewer.app" -name "qt.conf" -o -name "libqcocoa*" 2>/dev/null || echo "qt.conf NOT FOUND"
-          ls -la "dist/SSD_VR_Fusion_Viewer.app/Contents/" 2>/dev/null
+          echo "=== qcocoa ==="
+          find "dist/SSD_VR_Fusion_Viewer.app" -name "libqcocoa*" 2>/dev/null || echo "MISSING"
+          echo "=== qt.conf ==="
+          cat "dist/SSD_VR_Fusion_Viewer.app/Contents/Resources/qt.conf" 2>/dev/null || echo "MISSING"
 
       - name: Package DMG
         run: |
