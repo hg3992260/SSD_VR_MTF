@@ -77,6 +77,7 @@ def detect_semantic(
     sitk.WriteImage(resampled, nii_path)
 
     from totalsegmentator.python_api import totalsegmentator
+    import nnunetv2.training.nnUNetTrainer.variants.training_length.nnUNetTrainer_Xepochs_NoMirroring  # PyInstaller hook
     seg_nifti = totalsegmentator(nii_path, task=task, fast=True, device="gpu", quiet=True, output_type="nifti")
 
     out_nii = os.path.join(tmpdir, "seg.nii.gz")
