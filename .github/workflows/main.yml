@@ -1,4 +1,4 @@
-name: Build SSD+VR Fusion Viewer EXE
+name: Build SSD+VR for Windows (EXE)
 
 on:
   push:
@@ -10,20 +10,11 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~\AppData\Local\pip\Cache
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
@@ -50,7 +41,6 @@ jobs:
             --collect-all=vtkmodules `
             --collect-all=SimpleITK `
             --hidden-import=PyCt6 `
-            --hidden-import=PyCt6.widgets `
             --hidden-import=PyCt6.widgets.c_button `
             --hidden-import=PyCt6.widgets.c_label `
             --hidden-import=PyCt6.widgets.c_line_edit `
@@ -58,10 +48,8 @@ jobs:
             --hidden-import=PyCt6.widgets.c_slider `
             --hidden-import=PyCt6.widgets.c_frame `
             --hidden-import=PyCt6.widgets.c_text_edit `
-            --hidden-import=PyCt6.windows `
             --hidden-import=PyCt6.windows.c_main_window `
             --hidden-import=PyCt6.windows.c_toplevel `
-            --hidden-import=PyCt6.appearance `
             --hidden-import=PyCt6.appearance.theme_manager `
             --hidden-import=PyCt6.appearance.mode_manager `
             --hidden-import=PySide6.QtSvg `
@@ -74,13 +62,13 @@ jobs:
             --exclude-module=tkinter `
             ssd_vr_viewer.py
 
-      - name: Upload EXE artifact (always)
+      - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: SSD_VR_Fusion_Viewer
+          name: SSD_VR_Fusion_Viewer_Win
           path: dist/SSD_VR_Fusion_Viewer.exe
 
-      - name: Create Release (tag only)
+      - name: Release (tag only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
