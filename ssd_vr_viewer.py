@@ -204,18 +204,13 @@ import tempfile
 from vtkmodules.util import numpy_support
 import numpy as np
 
-from segmentation.pipeline import SegmentationPipeline
-from segmentation.visualizer import SegmentationVisualizer
-from segmentation.config import (
-    DEFAULT_CLOSING_KERNEL,
-    DEFAULT_HU_WINDOW,
-    DEFAULT_MIN_COMPONENT_SIZE,
-    DEFAULT_NUM_CLICKS,
-    DEFAULT_TARGET_SPACING,
-    DEFAULT_THRESHOLD,
-)
+from segmentation.roi_pipeline import ROIPipeline
 
 HAS_MC_RDENOISER = False
+
+ROI_REPLACEMENT_HU = 4096
+ROI_REPLACEMENT_COLOR = (0.15, 1.0, 0.18)
+ROI_RESULT_BED_OFFSET_MM = 0.0
 
 def _compute_frangi_from_hessian(Hxx, Hyy, Hzz, Hxy, Hxz, Hyz,
                                   alpha=1.0, beta=0.5, gamma=10.0, dark_ridges=True):
@@ -711,6 +706,13 @@ def build_reader(dicom_path: str, denoise_method: str = "gaussian", use_clahe: b
     img_vtk.SetDimensions(int(final_size[0]), int(final_size[1]), int(final_size[2]))
     img_vtk.SetSpacing(float(spacing[0]), float(spacing[1]), float(spacing[2])) 
     img_vtk.SetOrigin(float(origin[0]), float(origin[1]), float(origin[2]))     
+    if hasattr(img_vtk, "SetDirectionMatrix") and image.GetDimension() >= 3:
+        direction = image.GetDirection()
+        direction_matrix = vtk.vtkMatrix3x3()
+        for row in range(3):
+            for col in range(3):
+                direction_matrix.SetElement(row, col, float(direction[row * 3 + col]))
+        img_vtk.SetDirectionMatrix(direction_matrix)
     img_vtk.GetPointData().SetScalars(vtk_data)
 
     return img_vtk, downsample_msg
@@ -885,7 +887,7 @@ class RangeSlider(QtWidgets.QWidget):
         return max(self.minimum, min(self.maximum, val))
         
     def mousePressEvent(self, event):
-        x = event.pos().x()
+        x = event.position().toPoint().x()
         lx = self._val_to_pos(self._lower)
         ux = self._val_to_pos(self._upper)
         
@@ -904,7 +906,7 @@ class RangeSlider(QtWidgets.QWidget):
     def mouseMoveEvent(self, event):
         if not self._active_handle:
             return
-        x = event.pos().x()
+        x = event.position().toPoint().x()
         val = self._pos_to_val(x)
         
         if self._active_handle == 'lower':
@@ -948,6 +950,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.controller = None  # type: Optional[FusionController]
         self.current_ssd_volume = None  # type: Optional[vtk.vtkVolume]
         self.current_vr_volume = None  # type: Optional[vtk.vtkVolume]
+        self.current_roi_volume = None
+        self.current_ssd_mapper = None
+        self.current_vr_mapper = None
+        self.current_roi_mapper = None
+        self.vr_producer = None
+        self.roi_producer = None
         self.render_mode = "stable"  # stable | hd_surface | cinematic | nature_channels | spectral | exposure_render
         self.mc_quality = 0.60  # 0-1, 越高路径追踪采样越密
         self.scatter_blend = 0.65  # 0-1, 混合散射强度
@@ -981,6 +989,17 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.seg_result = None
         self.original_sitk_image = None
         self.seg_renderer = None
+        self.roi_pipeline = None
+        self.roi_results = None
+        self.roi_detect_bone = False
+        self.roi_detect_vessel = True
+        self.roi_detect_tissue = False
+        self.vr_image_data = None
+        self.roi_image_data = None
+        self.vr_base_array = None
+        self.vr_work_array = None
+        self.roi_array = None
+        self.original_image_shape_zyx = None
         self.right_volume = None
         self.right_producer = None
         self.right_mapper = None
@@ -1424,7 +1443,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._build_ui()
         if self.initial_input and os.path.exists(self.initial_input):
             self.path_edit.line_edit().setText(self.initial_input)
-            self.load_dicom()
 
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget(self)
@@ -1684,114 +1702,93 @@ class ViewerWindow(QtWidgets.QMainWindow):
         render_scroll.setWidget(render_page)
         self.pages.addTab(render_scroll, "渲染")
 
-        # === Tab 1: 分割 (Segmentation) ===
-        segment_page = QtWidgets.QWidget()
-        segment_layout = QtWidgets.QVBoxLayout(segment_page)
+        # === Tab 1: TotalSegmentator 语义分割 ===
+        roi_page = QtWidgets.QWidget()
+        roi_layout = QtWidgets.QVBoxLayout(roi_page)
 
-        seg_hu_layout = QtWidgets.QHBoxLayout()
-        seg_hu_layout.addWidget(QtWidgets.QLabel("HU窗口下限:"))
-        self.seg_hu_low = QtWidgets.QSpinBox()
-        self.seg_hu_low.setRange(-1000, 3000)
-        self.seg_hu_low.setValue(DEFAULT_HU_WINDOW[0])
-        self.seg_hu_low.setSuffix(" HU")
-        seg_hu_layout.addWidget(self.seg_hu_low)
-        seg_hu_layout.addWidget(QtWidgets.QLabel("上限:"))
-        self.seg_hu_high = QtWidgets.QSpinBox()
-        self.seg_hu_high.setRange(-1000, 3000)
-        self.seg_hu_high.setValue(DEFAULT_HU_WINDOW[1])
-        self.seg_hu_high.setSuffix(" HU")
-        seg_hu_layout.addWidget(self.seg_hu_high)
-        seg_hu_layout.addStretch()
-        segment_layout.addLayout(seg_hu_layout)
+        roi_label = QtWidgets.QLabel("TotalSegmentator v2：全身117类语义分割\n自动识别骨骼/血管/器官/肌肉，基于 nnU-Net")
+        roi_label.setWordWrap(True)
+        roi_label.setStyleSheet("font-size: 13px; padding: 6px;")
+        roi_layout.addWidget(roi_label)
 
-        seg_spacing_layout = QtWidgets.QHBoxLayout()
-        seg_spacing_layout.addWidget(QtWidgets.QLabel("重采样间距:"))
-        self.seg_spacing_combo = QtWidgets.QComboBox()
-        self.seg_spacing_combo.addItems(["0.5 mm", "0.6 mm", "0.8 mm", "不移采样"])
-        self.seg_spacing_combo.setCurrentIndex(1)
-        seg_spacing_layout.addWidget(self.seg_spacing_combo)
-        seg_spacing_layout.addWidget(QtWidgets.QLabel("SAM Clicks:"))
-        self.seg_clicks = QtWidgets.QSpinBox()
-        self.seg_clicks.setRange(1, 5)
-        self.seg_clicks.setValue(DEFAULT_NUM_CLICKS)
-        seg_spacing_layout.addWidget(self.seg_clicks)
-        seg_spacing_layout.addWidget(QtWidgets.QLabel("阈值:"))
-        self.seg_threshold = QtWidgets.QDoubleSpinBox()
-        self.seg_threshold.setRange(0.05, 0.95)
-        self.seg_threshold.setSingleStep(0.05)
-        self.seg_threshold.setValue(DEFAULT_THRESHOLD)
-        self.seg_threshold.setDecimals(2)
-        seg_spacing_layout.addWidget(self.seg_threshold)
-        seg_spacing_layout.addStretch()
-        segment_layout.addLayout(seg_spacing_layout)
-
-        seg_post_layout = QtWidgets.QHBoxLayout()
-        self.seg_check_cc = QtWidgets.QCheckBox("连通域过滤 (最小体素)")
-        self.seg_check_cc.setChecked(True)
-        self.seg_cc_size = QtWidgets.QSpinBox()
-        self.seg_cc_size.setRange(10, 100000)
-        self.seg_cc_size.setValue(DEFAULT_MIN_COMPONENT_SIZE)
-        self.seg_cc_size.setSingleStep(100)
-        seg_post_layout.addWidget(self.seg_check_cc)
-        seg_post_layout.addWidget(self.seg_cc_size)
-        self.seg_check_close = QtWidgets.QCheckBox("形态学闭运算 (核大小)")
-        self.seg_check_close.setChecked(True)
-        self.seg_close_kernel = QtWidgets.QSpinBox()
-        self.seg_close_kernel.setRange(1, 10)
-        self.seg_close_kernel.setValue(DEFAULT_CLOSING_KERNEL)
-        seg_post_layout.addWidget(self.seg_check_close)
-        seg_post_layout.addWidget(self.seg_close_kernel)
-        seg_post_layout.addStretch()
-        segment_layout.addLayout(seg_post_layout)
-
-        seg_vis_layout = QtWidgets.QHBoxLayout()
-        self.seg_check_surface = QtWidgets.QCheckBox("显示血管表面")
-        self.seg_check_surface.setChecked(True)
-        self.seg_check_volume = QtWidgets.QCheckBox("半透明体积渲染")
-        seg_vis_layout.addWidget(self.seg_check_surface)
-        seg_vis_layout.addWidget(self.seg_check_volume)
-        seg_vis_layout.addStretch()
-        segment_layout.addLayout(seg_vis_layout)
-
-        seg_btn_layout = QtWidgets.QHBoxLayout()
-        self.seg_btn_start = CButton(master=segment_page, width=80, text="▶ 开始分割",
-                                      command=self.on_seg_start,
+        roi_btn_layout = QtWidgets.QHBoxLayout()
+        self.roi_btn_start = CButton(master=roi_page, width=140, text="▶ 运行语义分割",
+                                      command=self.on_roi_start,
                                       background_color=("#782838", "#8a3448"),
                                       hover_color=("#8e3848", "#9e4858"),
                                       text_color=("#ffffff", "#ffffff"))
-        self.seg_btn_cancel = CButton(master=segment_page, width=70, text="⏹ 停止",
-                                      command=self.on_seg_cancel,
-                                      background_color=("#402020", "#4e2828"),
-                                      hover_color=("#503030", "#5e3838"))
-        self.seg_btn_clear = CButton(master=segment_page, width=70, text="🗑 清除覆盖",
-                                     command=self.on_seg_clear,
-                                     background_color=("#303040", "#3c3c4e"),
-                                     hover_color=("#404050", "#4c4c5e"))
-        self.seg_btn_clear.setEnabled(False)
-        seg_btn_layout.addWidget(self.seg_btn_start)
-        seg_btn_layout.addWidget(self.seg_btn_cancel)
-        seg_btn_layout.addWidget(self.seg_btn_clear)
-        seg_btn_layout.addStretch()
-        segment_layout.addLayout(seg_btn_layout)
+        self.roi_btn_cancel = CButton(master=roi_page, width=70, text="⏹ 停止",
+                                       command=self.on_roi_cancel,
+                                       background_color=("#402020", "#4e2828"),
+                                       hover_color=("#503030", "#5e3838"))
+        self.roi_btn_clear = CButton(master=roi_page, width=80, text="🗑 清空结果",
+                                      command=self.on_roi_clear,
+                                      background_color=("#303040", "#3c3c4e"),
+                                      hover_color=("#404050", "#4c4c5e"))
+        self.roi_btn_clear.setEnabled(False)
+        roi_btn_layout.addWidget(self.roi_btn_start)
+        roi_btn_layout.addWidget(self.roi_btn_cancel)
+        roi_btn_layout.addWidget(self.roi_btn_clear)
+        roi_btn_layout.addStretch()
+        roi_layout.addLayout(roi_btn_layout)
 
-        seg_progress_group = QtWidgets.QGroupBox("分割进度")
-        seg_progress_layout = QtWidgets.QVBoxLayout(seg_progress_group)
-        self.seg_progress_bar = QtWidgets.QProgressBar()
-        self.seg_progress_bar.setRange(0, 100)
-        self.seg_progress_bar.setValue(0)
-        self.seg_progress_label = QtWidgets.QLabel("就绪")
-        seg_progress_layout.addWidget(self.seg_progress_bar)
-        seg_progress_layout.addWidget(self.seg_progress_label)
-        segment_layout.addWidget(seg_progress_group)
+        roi_config_group = QtWidgets.QGroupBox("权重路径")
+        roi_config_layout = QtWidgets.QVBoxLayout(roi_config_group)
+        roi_path_layout = QtWidgets.QHBoxLayout()
+        self.roi_weight_edit = QtWidgets.QLineEdit()
+        self.roi_weight_edit.setPlaceholderText("totalseg_weights 文件夹路径...")
+        self.roi_weight_edit.textChanged.connect(self._on_weight_path_changed)
+        roi_path_layout.addWidget(self.roi_weight_edit)
+        btn_browse = CButton(master=roi_page, width=50, text="浏览",
+                             command=self._on_browse_weights,
+                             background_color=("#383850", "#484860"),
+                             hover_color=("#484860", "#585870"),
+                             text_color=("#d0d0e0", "#d0d0e0"))
+        roi_path_layout.addWidget(btn_browse)
+        roi_config_layout.addLayout(roi_path_layout)
+        self.roi_weight_status = QtWidgets.QLabel("")
+        self.roi_weight_status.setStyleSheet("font-size: 10px; color: #88b0c8;")
+        roi_config_layout.addWidget(self.roi_weight_status)
+        self._cached_weight_tasks = {}  # {folder: task_name}
+        self.roi_current_task = "total"
+        roi_layout.addWidget(roi_config_group)
 
-        self.seg_stats_group = QtWidgets.QGroupBox("分割结果")
-        self.seg_stats_group.setVisible(False)
-        seg_stats_layout = QtWidgets.QHBoxLayout(self.seg_stats_group)
-        self.seg_stats_label = QtWidgets.QLabel("")
-        seg_stats_layout.addWidget(self.seg_stats_label)
-        segment_layout.addWidget(self.seg_stats_group)
+        roi_progress_group = QtWidgets.QGroupBox("检测进度")
+        roi_progress_layout = QtWidgets.QVBoxLayout(roi_progress_group)
+        self.roi_progress_bar = QtWidgets.QProgressBar()
+        self.roi_progress_bar.setRange(0, 100)
+        self.roi_progress_bar.setValue(0)
+        self.roi_progress_label = QtWidgets.QLabel("就绪")
+        self.roi_progress_log = QtWidgets.QTextEdit()
+        self.roi_progress_log.setReadOnly(True)
+        self.roi_progress_log.setMaximumHeight(120)
+        self.roi_progress_log.setStyleSheet("QTextEdit { background-color: #1a1a24; color: #b0b8c4; font-size: 11px; border: 1px solid #3a3a4e; }")
+        roi_progress_layout.addWidget(self.roi_progress_bar)
+        roi_progress_layout.addWidget(self.roi_progress_label)
+        roi_progress_layout.addWidget(self.roi_progress_log)
+        roi_layout.addWidget(roi_progress_group)
 
-        self.pages.addTab(segment_page, "分割")
+        self.roi_results_label = QtWidgets.QLabel("")
+        self.roi_results_label.setWordWrap(True)
+        self.roi_results_label.setStyleSheet("font-size: 11px; color: #88b0c8; padding: 2px;")
+        roi_layout.addWidget(self.roi_results_label)
+
+        self.roi_tree = QtWidgets.QTreeWidget()
+        self.roi_tree.setHeaderLabels(["解剖结构", "体积 cm³", "来源"])
+        self.roi_tree.setAlternatingRowColors(True)
+        self.roi_tree.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.roi_tree.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
+        self.roi_tree.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        roi_header = self.roi_tree.header()
+        roi_header.setStretchLastSection(False)
+        roi_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        roi_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        roi_header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.roi_tree.itemSelectionChanged.connect(self._on_roi_tree_selection_changed)
+        roi_layout.addWidget(self.roi_tree, 1)
+
+        self.pages.addTab(roi_page, "自动ROI检测")
+        self.init_weight_path()
 
         # ---- PCCT K-edge 物质渲染标签 ----
         kedge_page = QtWidgets.QWidget()
@@ -1861,9 +1858,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.primary_slider.slider().valueChanged.connect(self.on_cr_params_change)
         self.shadow_slider.slider().valueChanged.connect(self.on_cr_params_change)
 
-        self.seg_check_surface.stateChanged.connect(self._on_seg_vis_change)
-        self.seg_check_volume.stateChanged.connect(self._on_seg_vis_change)
-
         self.kedge_mat_combo.currentIndexChanged.connect(self._render_kedge_material)
 
         self.box_widget = None
@@ -1882,17 +1876,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.pages.currentChanged.connect(self._on_tab_changed)
 
     def _on_tab_changed(self, index: int) -> None:
-        if index == 0:
+        if index in (0, 1):
             self.renderer.SetViewport(0.0, 0.0, 1.0, 1.0)
             self.seg_renderer.SetViewport(0.0, 0.0, 0.0, 1.0)
             self.kedge_renderer.SetViewport(0.0, 0.0, 0.0, 1.0)
-        elif index == 1:
-            self.renderer.SetViewport(0.0, 0.0, 0.5, 1.0)
-            self.seg_renderer.SetViewport(0.5, 0.0, 1.0, 1.0)
-            self.kedge_renderer.SetViewport(0.0, 0.0, 0.0, 1.0)
-            cam = self.renderer.GetActiveCamera()
-            if cam:
-                self.seg_renderer.SetActiveCamera(cam)
         else:
             self.renderer.SetViewport(0.0, 0.0, 0.5, 1.0)
             self.seg_renderer.SetViewport(0.0, 0.0, 0.0, 1.0)
@@ -2271,8 +2258,17 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.current_ssd_volume.GetProperty().SetScalarOpacity(make_opacity(adj_ssd_op, self._effective_ssd_scale(ssd_scale)))
             self.current_ssd_volume.GetProperty().SetColor(make_color(adj_ssd_co))
         if self.current_vr_volume is not None:
-            self.current_vr_volume.GetProperty().SetScalarOpacity(make_opacity(adj_vr_op, self._effective_vr_scale(vr_scale)))
-            self.current_vr_volume.GetProperty().SetColor(make_color(adj_vr_co))
+            self.current_vr_volume.GetProperty().SetScalarOpacity(
+                make_opacity(
+                    self.get_adjusted_points(self._roi_enhanced_vr_opacity_points(self.vr_opacity_points), wl_offset, ww_scale),
+                    self._effective_vr_scale(vr_scale),
+                )
+            )
+            self.current_vr_volume.GetProperty().SetColor(
+                make_color(
+                    self.get_adjusted_points(self._roi_enhanced_vr_color_points(self.vr_color_points), wl_offset, ww_scale)
+                )
+            )
 
         if self.controller is not None:
             self.controller.ssd_points = adj_ssd_op
@@ -2867,8 +2863,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 self.er_wrapper.reset_accumulation()
             else:
                 if self.current_vr_volume is not None:
-                    self.current_vr_volume.GetProperty().SetScalarOpacity(make_opacity(self.vr_opacity_points))
-                    self.current_vr_volume.GetProperty().SetColor(make_color(self.vr_color_points))
+                    self.current_vr_volume.GetProperty().SetScalarOpacity(
+                        make_opacity(self._roi_enhanced_vr_opacity_points(self.vr_opacity_points))
+                    )
+                    self.current_vr_volume.GetProperty().SetColor(
+                        make_color(self._roi_enhanced_vr_color_points(self.vr_color_points))
+                    )
             
             self.render_window.Render()
 
@@ -3122,9 +3122,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         if self.current_vr_volume is not None:
             vr_prop = self.current_vr_volume.GetProperty()
-            vr_prop.SetColor(make_color(self.vr_color_points))
+            vr_prop.SetColor(make_color(self._roi_enhanced_vr_color_points(self.vr_color_points)))
             vr_prop.SetScalarOpacity(
-                make_opacity(self.vr_opacity_points, self.vr_slider.slider().value() / 100.0)
+                make_opacity(
+                    self._roi_enhanced_vr_opacity_points(self.vr_opacity_points),
+                    self.vr_slider.slider().value() / 100.0,
+                )
             )
             self._configure_vr_property_by_mode(vr_prop)
 
@@ -3182,6 +3185,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.box_widget = None
         self.current_vr_mapper = None
         self.current_ssd_mapper = None
+        self.current_roi_mapper = None
+        self.vr_producer = None
+        self.roi_producer = None
+        self.vr_image_data = None
+        self.roi_image_data = None
+        self.vr_base_array = None
+        self.vr_work_array = None
+        self.roi_array = None
+        self.original_image_shape_zyx = None
 
         if hasattr(self, 'current_multi_volume') and self.current_multi_volume is not None:
             self.renderer.RemoveVolume(self.current_multi_volume)
@@ -3189,10 +3201,279 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if self.current_vr_volume is not None:
             self.renderer.RemoveVolume(self.current_vr_volume)
             self.current_vr_volume = None
+        if self.current_roi_volume is not None:
+            self.renderer.RemoveVolume(self.current_roi_volume)
+            self.current_roi_volume = None
         if self.current_ssd_volume is not None:
             self.renderer.RemoveVolume(self.current_ssd_volume)
             self.current_ssd_volume = None
         self.controller = None
+
+    def _clone_vtk_image(self, image_data: vtk.vtkImageData) -> vtk.vtkImageData:
+        cloned = vtk.vtkImageData()
+        cloned.DeepCopy(image_data)
+        return cloned
+
+    def _refresh_vr_scalar_binding(self) -> None:
+        if self.vr_image_data is None or self.vr_work_array is None:
+            return
+        vtk_array = numpy_support.numpy_to_vtk(
+            num_array=self.vr_work_array.ravel(order="C"),
+            deep=True,
+            array_type=vtk.VTK_SHORT,
+        )
+        self.vr_image_data.GetPointData().SetScalars(vtk_array)
+        self.vr_image_data.Modified()
+        vr_producer = getattr(self, "vr_producer", None)
+        if vr_producer is not None:
+            vr_producer.Modified()
+        vr_mapper = getattr(self, "current_vr_mapper", None)
+        if vr_mapper is not None:
+            vr_mapper.Modified()
+
+    def _ensure_roi_volume(self) -> bool:
+        if self.current_vr_volume is None or self.vr_image_data is None:
+            return False
+        if self.current_roi_volume is not None:
+            return True
+
+        roi_image = self._clone_vtk_image(self.vr_image_data)
+        dims = roi_image.GetDimensions()
+        roi_array = np.full((dims[2], dims[1], dims[0]), -1024, dtype=np.int16)
+        vtk_array = numpy_support.numpy_to_vtk(
+            num_array=roi_array.ravel(order="C"),
+            deep=True,
+            array_type=vtk.VTK_SHORT,
+        )
+        roi_image.GetPointData().SetScalars(vtk_array)
+        roi_image.Modified()
+
+        self.roi_image_data = roi_image
+        self.roi_array = roi_array
+        self.roi_producer = vtk.vtkTrivialProducer()
+        self.roi_producer.SetOutput(roi_image)
+
+        roi_mapper = vtk.vtkGPUVolumeRayCastMapper()
+        roi_mapper.SetInputConnection(self.roi_producer.GetOutputPort())
+        roi_mapper.SetBlendModeToComposite()
+        roi_mapper.SetSampleDistance(1.2)
+
+        if self.current_vr_mapper is not None and hasattr(self.current_vr_mapper, "GetCropping") and self.current_vr_mapper.GetCropping():
+            roi_mapper.SetCropping(True)
+            roi_mapper.SetCroppingRegionPlanes(self.current_vr_mapper.GetCroppingRegionPlanes())
+
+        roi_prop = vtk.vtkVolumeProperty()
+        roi_prop.SetColor(make_color([
+            (-1024.0, 0.0, 0.0, 0.0),
+            (ROI_REPLACEMENT_HU - 8.0, 0.0, 0.0, 0.0),
+            (ROI_REPLACEMENT_HU, ROI_REPLACEMENT_COLOR[0], ROI_REPLACEMENT_COLOR[1], ROI_REPLACEMENT_COLOR[2]),
+            (ROI_REPLACEMENT_HU + 8.0, 0.95, 1.0, 0.95),
+        ]))
+        roi_prop.SetScalarOpacity(make_opacity([
+            (-1024.0, 0.0),
+            (ROI_REPLACEMENT_HU - 8.0, 0.0),
+            (ROI_REPLACEMENT_HU, 0.90),
+            (ROI_REPLACEMENT_HU + 8.0, 0.98),
+        ], 1.0))
+        roi_prop.SetInterpolationTypeToLinear()
+        self._configure_vr_property_by_mode(roi_prop)
+
+        roi_volume = vtk.vtkVolume()
+        roi_volume.SetMapper(roi_mapper)
+        roi_volume.SetProperty(roi_prop)
+        roi_volume.SetPosition(0.0, float(ROI_RESULT_BED_OFFSET_MM), 0.0)
+        roi_volume.SetVisibility(False)
+
+        self.current_roi_mapper = roi_mapper
+        self.current_roi_volume = roi_volume
+        self.renderer.AddVolume(roi_volume)
+        return True
+
+    def _clear_roi_volume(self) -> None:
+        if getattr(self, "roi_array", None) is not None:
+            self.roi_array.fill(-1024)
+            vtk_array = numpy_support.numpy_to_vtk(
+                num_array=self.roi_array.ravel(order="C"),
+                deep=True,
+                array_type=vtk.VTK_SHORT,
+            )
+            self.roi_image_data.GetPointData().SetScalars(vtk_array)
+            self.roi_image_data.Modified()
+            if getattr(self, "roi_producer", None) is not None:
+                self.roi_producer.Modified()
+            if self.current_roi_mapper is not None:
+                self.current_roi_mapper.Modified()
+        if self.current_roi_volume is not None:
+            self.current_roi_volume.SetVisibility(False)
+
+    def _restore_vr_pixels(self) -> None:
+        if self.vr_base_array is None or self.vr_work_array is None:
+            return
+        np.copyto(self.vr_work_array, self.vr_base_array)
+        self._refresh_vr_scalar_binding()
+        self._clear_roi_volume()
+
+    def _apply_roi_pixel_replacement(self, blocks: List) -> None:
+        if not self._ensure_roi_volume():
+            return
+        self._clear_roi_volume()
+        replaced_voxels = 0
+        mapped_blocks = 0
+        for block in blocks:
+            roi_view, mask = self._map_block_to_vr_view(block)
+            if roi_view is None or mask is None:
+                continue
+            if roi_view.shape != mask.shape:
+                continue
+            mapped_bbox = getattr(block, "_mapped_bbox_zyx", None)
+            if mapped_bbox is None:
+                continue
+            (z0, y0, x0), (z1, y1, x1) = mapped_bbox
+            target = self.roi_array[z0:z1, y0:y1, x0:x1]
+            if target.shape != mask.shape:
+                continue
+            mapped_blocks += 1
+            replaced_voxels += int(mask.sum())
+            target[mask] = ROI_REPLACEMENT_HU
+        vtk_array = numpy_support.numpy_to_vtk(
+            num_array=self.roi_array.ravel(order="C"),
+            deep=True,
+            array_type=vtk.VTK_SHORT,
+        )
+        self.roi_image_data.GetPointData().SetScalars(vtk_array)
+        self.roi_image_data.Modified()
+        if self.roi_producer is not None:
+            self.roi_producer.Modified()
+        if self.current_roi_mapper is not None:
+            self.current_roi_mapper.Modified()
+        if self.current_roi_volume is not None:
+            self.current_roi_volume.SetVisibility(mapped_blocks > 0)
+        # #region debug-point C:vr-replacement
+        import json, urllib.request, time
+        _p = '.dbg/roi-result-drift.env'
+        _u, _s = 'http://127.0.0.1:7777/event', 'roi-result-drift'
+        try:
+            with open(_p, encoding='utf-8') as f:
+                _c = f.read()
+            _u = next((l.split('=', 1)[1].strip() for l in _c.split('\n') if l.startswith('DEBUG_SERVER_URL=')), _u)
+            _s = next((l.split('=', 1)[1].strip() for l in _c.split('\n') if l.startswith('DEBUG_SESSION_ID=')), _s)
+        except Exception:
+            pass
+        _payload = {
+            'sessionId': _s,
+            'runId': 'pre-fix',
+            'hypothesisId': 'C',
+            'location': 'ssd_vr_viewer.py:_apply_roi_pixel_replacement',
+            'msg': '[DEBUG] vr pixel replacement summary',
+            'data': {
+                'selected_blocks': int(len(blocks)),
+                'mapped_blocks': int(mapped_blocks),
+                'replaced_voxels': int(replaced_voxels),
+                'vr_shape': tuple(int(v) for v in self.roi_array.shape) if getattr(self, "roi_array", None) is not None else None,
+                'orig_shape': tuple(int(v) for v in self.original_image_shape_zyx) if self.original_image_shape_zyx is not None else None,
+            },
+            'ts': int(time.time() * 1000),
+        }
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    _u,
+                    data=json.dumps(_payload).encode(),
+                    headers={'Content-Type': 'application/json'},
+                ),
+                timeout=0.8,
+            ).read()
+        except Exception:
+            pass
+        # #endregion
+
+    def _map_block_to_vr_view(self, block) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if self.vr_work_array is None:
+            return None, None
+        vr_shape = self.vr_work_array.shape
+        if self.original_sitk_image is None or self.vr_image_data is None:
+            z0, z1 = block.bbox_z
+            y0, y1 = block.bbox_y
+            x0, x1 = block.bbox_x
+            roi_view = self.vr_work_array[z0:z1, y0:y1, x0:x1]
+            return roi_view, block.mask.astype(bool, copy=False)
+
+        orig_spacing = np.array(self.original_sitk_image.GetSpacing()[:3], dtype=np.float64)
+        orig_origin = np.array(self.original_sitk_image.GetOrigin()[:3], dtype=np.float64)
+        vr_spacing = np.array(self.vr_image_data.GetSpacing(), dtype=np.float64)
+        vr_origin = np.array(self.vr_image_data.GetOrigin(), dtype=np.float64)
+
+        world_start = orig_origin + np.array([
+            block.bbox_x[0] * orig_spacing[0],
+            block.bbox_y[0] * orig_spacing[1],
+            block.bbox_z[0] * orig_spacing[2],
+        ], dtype=np.float64)
+        world_end = orig_origin + np.array([
+            block.bbox_x[1] * orig_spacing[0],
+            block.bbox_y[1] * orig_spacing[1],
+            block.bbox_z[1] * orig_spacing[2],
+        ], dtype=np.float64)
+
+        x0 = int(np.floor((world_start[0] - vr_origin[0]) / vr_spacing[0]))
+        y0 = int(np.floor((world_start[1] - vr_origin[1]) / vr_spacing[1]))
+        z0 = int(np.floor((world_start[2] - vr_origin[2]) / vr_spacing[2]))
+        x1 = int(np.ceil((world_end[0] - vr_origin[0]) / vr_spacing[0]))
+        y1 = int(np.ceil((world_end[1] - vr_origin[1]) / vr_spacing[1]))
+        z1 = int(np.ceil((world_end[2] - vr_origin[2]) / vr_spacing[2]))
+
+        z0 = max(0, min(z0, vr_shape[0] - 1))
+        y0 = max(0, min(y0, vr_shape[1] - 1))
+        x0 = max(0, min(x0, vr_shape[2] - 1))
+        z1 = max(z0 + 1, min(z1, vr_shape[0]))
+        y1 = max(y0 + 1, min(y1, vr_shape[1]))
+        x1 = max(x0 + 1, min(x1, vr_shape[2]))
+
+        roi_view = self.vr_work_array[z0:z1, y0:y1, x0:x1]
+        if roi_view.size == 0:
+            return None, None
+
+        mask = self._resize_mask_nearest(block.mask.astype(bool, copy=False), roi_view.shape)
+        block._mapped_bbox_zyx = ((z0, y0, x0), (z1, y1, x1))
+        return roi_view, mask
+
+    def _resize_mask_nearest(self, mask: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
+        if mask.shape == target_shape:
+            return mask
+        z_idx = np.clip(np.round(np.linspace(0, mask.shape[0] - 1, target_shape[0])).astype(np.int32), 0, mask.shape[0] - 1)
+        y_idx = np.clip(np.round(np.linspace(0, mask.shape[1] - 1, target_shape[1])).astype(np.int32), 0, mask.shape[1] - 1)
+        x_idx = np.clip(np.round(np.linspace(0, mask.shape[2] - 1, target_shape[2])).astype(np.int32), 0, mask.shape[2] - 1)
+        return mask[np.ix_(z_idx, y_idx, x_idx)]
+
+    def _roi_enhanced_vr_color_points(self, points: List[Tuple[float, float, float, float]]) -> List[Tuple[float, float, float, float]]:
+        base = [tuple(p) for p in points if p[0] < ROI_REPLACEMENT_HU - 1]
+        base.extend([
+            (ROI_REPLACEMENT_HU - 8.0, 0.10, 0.85, 0.12),
+            (ROI_REPLACEMENT_HU, ROI_REPLACEMENT_COLOR[0], ROI_REPLACEMENT_COLOR[1], ROI_REPLACEMENT_COLOR[2]),
+            (ROI_REPLACEMENT_HU + 8.0, 0.95, 1.0, 0.95),
+        ])
+        return base
+
+    def _roi_enhanced_vr_opacity_points(self, points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        base = [tuple(p) for p in points if p[0] < ROI_REPLACEMENT_HU - 1]
+        base.extend([
+            (ROI_REPLACEMENT_HU - 8.0, 0.22),
+            (ROI_REPLACEMENT_HU, 0.72),
+            (ROI_REPLACEMENT_HU + 8.0, 0.92),
+        ])
+        return base
+
+    def _update_vr_transfer_functions(self) -> None:
+        if self.current_vr_volume is None:
+            return
+        wl_offset = self.wl_slider.slider().value()
+        ww_scale = self.ww_slider.slider().value() / 100.0
+        vr_scale = self.vr_slider.slider().value() / 100.0
+        adj_vr_op = self.get_adjusted_points(self._roi_enhanced_vr_opacity_points(self.vr_opacity_points), wl_offset, ww_scale)
+        adj_vr_co = self.get_adjusted_points(self._roi_enhanced_vr_color_points(self.vr_color_points), wl_offset, ww_scale)
+        vr_prop = self.current_vr_volume.GetProperty()
+        vr_prop.SetScalarOpacity(make_opacity(adj_vr_op, self._effective_vr_scale(vr_scale)))
+        vr_prop.SetColor(make_color(adj_vr_co))
+        self._configure_vr_property_by_mode(vr_prop)
 
     def load_dicom(self) -> None:
         dicom_path = self.path_edit.line_edit().text().strip()
@@ -3200,6 +3481,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "路径无效", "请输入有效的 DICOM 路径。")
             return
 
+        self._clear_old_volumes()
         self.btn_load.setEnabled(False)
         self.progress_text.clear()
         self.set_progress(0, "开始加载 DICOM (SimpleITK) ...")
@@ -3219,6 +3501,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 raise RuntimeError("无法提取有效的体数据。")
             dims = image_data.GetDimensions()
             self.image_data = image_data
+            self.vr_image_data = self._clone_vtk_image(image_data)
+            base_scalars = numpy_support.vtk_to_numpy(self.vr_image_data.GetPointData().GetScalars())
+            self.vr_base_array = base_scalars.reshape((dims[2], dims[1], dims[0])).copy()
+            self.vr_work_array = self.vr_base_array.copy()
+            self._refresh_vr_scalar_binding()
             self.set_progress(45, f"体数据尺寸: {dims[0]} x {dims[1]} x {dims[2]}")
 
             try:
@@ -3228,9 +3515,59 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     self.original_sitk_image = reader.Execute()
                 else:
                     self.original_sitk_image = sitk.ReadImage(dicom_path)
+                if self.original_sitk_image is not None and self.original_sitk_image.GetDimension() >= 3:
+                    orig_size = self.original_sitk_image.GetSize()
+                    self.original_image_shape_zyx = (
+                        int(orig_size[2]),
+                        int(orig_size[1]),
+                        int(orig_size[0]),
+                    )
             except Exception as e:
                 print(f"Warning: Failed to store original sitk image: {e}")
                 self.original_sitk_image = None
+                self.original_image_shape_zyx = None
+
+            # #region debug-point B:load-dicom-geometry
+            import json, urllib.request, time
+            _p = '.dbg/roi-surface-misalignment.env'
+            _u, _s = 'http://127.0.0.1:7777/event', 'roi-surface-misalignment'
+            try:
+                with open(_p, encoding='utf-8') as f:
+                    _c = f.read()
+                _u = next((l.split('=', 1)[1].strip() for l in _c.split('\n') if l.startswith('DEBUG_SERVER_URL=')), _u)
+                _s = next((l.split('=', 1)[1].strip() for l in _c.split('\n') if l.startswith('DEBUG_SESSION_ID=')), _s)
+            except Exception:
+                pass
+            _payload = {
+                'sessionId': _s,
+                'runId': 'pre-fix',
+                'hypothesisId': 'B',
+                'location': 'ssd_vr_viewer.py:load_dicom',
+                'msg': '[DEBUG] load_dicom geometry snapshot',
+                'data': {
+                    'dicom_path': dicom_path,
+                    'vtk_dims': tuple(int(v) for v in image_data.GetDimensions()),
+                    'vtk_spacing': tuple(float(v) for v in image_data.GetSpacing()),
+                    'vtk_origin': tuple(float(v) for v in image_data.GetOrigin()),
+                    'sitk_size': tuple(int(v) for v in self.original_sitk_image.GetSize()) if self.original_sitk_image is not None else None,
+                    'sitk_spacing': tuple(float(v) for v in self.original_sitk_image.GetSpacing()) if self.original_sitk_image is not None else None,
+                    'sitk_origin': tuple(float(v) for v in self.original_sitk_image.GetOrigin()) if self.original_sitk_image is not None else None,
+                    'sitk_direction': tuple(float(v) for v in self.original_sitk_image.GetDirection()) if self.original_sitk_image is not None else None,
+                },
+                'ts': int(time.time() * 1000),
+            }
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        _u,
+                        data=json.dumps(_payload).encode(),
+                        headers={'Content-Type': 'application/json'},
+                    ),
+                    timeout=0.8,
+                ).read()
+            except Exception:
+                pass
+            # #endregion
 
             if er_core is not None:
                 self.set_progress(50, "初始化 Exposure Render (CUDA) 核心...")
@@ -3262,6 +3599,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
             # 使用 vtkTrivialProducer 将 vtkImageData 接入到 Pipeline
             self.producer = vtk.vtkTrivialProducer()
             self.producer.SetOutput(image_data)
+            self.vr_producer = vtk.vtkTrivialProducer()
+            self.vr_producer.SetOutput(self.vr_image_data)
             
             # Use vtkGPUVolumeRayCastMapper as the primary engine for standard modes
             use_path_tracing = self.render_mode in ("cinematic", "nature_channels", "spectral", "dual_volume", "figure8_channels", "layer_channel", "frangi_channel")
@@ -3302,7 +3641,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
             vr_mapper = ssd_mapper if use_path_tracing else mapper_cls()    
             if not use_path_tracing:
-                vr_mapper.SetInputConnection(self.producer.GetOutputPort()) 
+                vr_mapper.SetInputConnection(self.vr_producer.GetOutputPort())
                 vr_mapper.SetBlendModeToComposite()
                 vr_mapper.SetSampleDistance(1.2)
                 if not self.cpu_render:
@@ -3335,8 +3674,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self._configure_ssd_property_by_mode(ssd_prop)
 
             vr_prop = vtk.vtkVolumeProperty()
-            vr_prop.SetColor(make_color(self.vr_color_points))
-            vr_prop.SetScalarOpacity(make_opacity(self.vr_opacity_points, 0.9))
+            vr_prop.SetColor(make_color(self._roi_enhanced_vr_color_points(self.vr_color_points)))
+            vr_prop.SetScalarOpacity(make_opacity(self._roi_enhanced_vr_opacity_points(self.vr_opacity_points), 0.9))
             vr_prop.SetInterpolationTypeToLinear()
             self._configure_vr_property_by_mode(vr_prop)
             vr_prop.SetScatteringAnisotropy(self.scatter_g)
@@ -3361,8 +3700,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 vr_volume.SetMapper(vr_mapper)
                 vr_volume.SetProperty(vr_prop)
 
-            self._clear_old_volumes()
-            
             # Setup VTK Image Actor for Exposure Render
             if self.er_image_actor is None:
                 w, h = self.render_window.GetSize()
@@ -3478,188 +3815,226 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.btn_load.setEnabled(True)
             QtWidgets.QApplication.restoreOverrideCursor()
 
-    def on_seg_start(self):
-        if self.original_sitk_image is None:
+    def _scan_weight_dir(self, path):
+        import re
+        if not os.path.isdir(path):
+            return []
+        TASK_DEFS = {
+            "total":     {"label": "total (v2 1.5mm) 1559例", "ids": {291,292,293,294,295,297}},
+            "total_v3":  {"label": "total_v3 (v3 1.5mm) 1830例", "ids": {831,832,833,834,835,836}},
+        }
+        found = set()
+        for entry in os.listdir(path):
+            for token in re.split(r'[_\.\-\s]+', entry):
+                tid = token
+                if tid.startswith("Dataset"): tid = tid[7:]
+                elif tid.startswith("Task"): tid = tid[4:]
+                try: found.add(int(tid))
+                except ValueError: pass
+
+        detected = []
+        for name, defn in TASK_DEFS.items():
+            if found & defn["ids"]:
+                detected.append((defn["label"], name))
+        return detected
+
+    def _on_browse_weights(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "选择 TotalSegmentator 权重文件夹",
+               self.roi_weight_edit.text().strip() or
+               os.path.join(os.path.dirname(os.path.abspath(__file__)), "totalseg_weights"))
+        if d:
+            self.roi_weight_edit.setText(d)
+
+    def _on_weight_path_changed(self, text):
+        path = text.strip()
+        if not path or not os.path.isdir(path):
+            self.roi_weight_status.setText("路径无效")
+            return
+
+        tasks = self._scan_weight_dir(path)
+        if not tasks:
+            self.roi_weight_status.setText("未检测到 TotalSegmentator 权重")
+            return
+
+        self.roi_current_task = tasks[0][1]
+        lines = "检测到: " + " · ".join(f"{lbl}" for lbl, _ in tasks)
+        self.roi_weight_status.setText(lines)
+        os.environ["nnUNet_results"] = path
+
+    def init_weight_path(self):
+        we = self.roi_weight_edit
+        for p in [
+            os.environ.get("nnUNet_results", ""),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "totalseg_weights"),
+        ]:
+            if os.path.isdir(p):
+                we.setText(p)
+                return
+
+    def on_roi_start(self):
+        if self.original_sitk_image is None or self.image_data is None:
             QtWidgets.QMessageBox.warning(self, "无数据", "请先在渲染页面加载DICOM数据。")
             return
-        self._do_segmentation()
+        self.roi_btn_start.setEnabled(False)
+        self.roi_btn_cancel.setEnabled(True)
+        self.roi_btn_clear.setEnabled(False)
+        self.roi_tree.clear()
+        self.roi_results_label.setText("")
+        self.roi_progress_bar.setValue(0)
+        self.roi_progress_label.setText("TotalSegmentator: 启动117类语义分割...")
+        self.roi_progress_log.clear()
+        self._restore_vr_pixels()
+        self.render_window.Render()
 
-    def on_seg_cancel(self):
-        if self.seg_pipeline and self.seg_pipeline.isRunning():
-            self.seg_pipeline.cancel()
-            self.seg_progress_label.setText("正在取消...")
-            self.seg_btn_cancel.setEnabled(False)
-
-    def on_seg_clear(self):
-        if self.seg_visualizer:
-            self.seg_visualizer.remove_all()
-        if self.right_volume:
-            self.seg_renderer.RemoveVolume(self.right_volume)
-            self.right_volume = None
-            self.right_producer = None
-            self.right_mapper = None
-        self.seg_result = None
-        self.seg_stats_group.setVisible(False)
-        self.seg_btn_clear.setEnabled(False)
-        self.seg_progress_bar.setValue(0)
-        self.seg_progress_label.setText("就绪")
-        self.iren.Render()
-
-    def _do_segmentation(self):
-        spacing_text = self.seg_spacing_combo.currentText()
-        if spacing_text == "不移采样":
-            spacing = None
-        else:
-            sp = float(spacing_text.split()[0])
-            spacing = (sp, sp, sp)
-
-        hu_low = self.seg_hu_low.value()
-        hu_high = self.seg_hu_high.value()
-        min_comp = self.seg_cc_size.value() if self.seg_check_cc.isChecked() else 0
-        close_k = self.seg_close_kernel.value() if self.seg_check_close.isChecked() else 1
-        clicks = self.seg_clicks.value()
-        threshold = self.seg_threshold.value()
-
-        self.seg_btn_start.setEnabled(False)
-        self.seg_btn_cancel.setEnabled(True)
-        self.seg_btn_clear.setEnabled(False)
-        self.seg_progress_bar.setValue(0)
-        self.seg_progress_label.setText("准备中...")
-
-        self.seg_pipeline = SegmentationPipeline(
-            sitk_image=self.original_sitk_image,
-            hu_window=(hu_low, hu_high),
-            target_spacing=spacing or self.original_sitk_image.GetSpacing(),
-            use_sam=True,
-            use_nnunet=False,
-            num_clicks=clicks,
-            threshold=threshold,
-            min_component_size=min_comp,
-            closing_kernel=close_k,
+        self.roi_pipeline = ROIPipeline(
+            image_data=self.image_data,
+            original_sitk_image=self.original_sitk_image,
+            task=self.roi_current_task,
         )
-        self.seg_pipeline.progress_signal.connect(self._on_seg_progress)
-        self.seg_pipeline.finished_signal.connect(self._on_seg_finished)
-        self.seg_pipeline.error_signal.connect(self._on_seg_error)
-        self.seg_pipeline.start()
+        self.roi_pipeline.progress_signal.connect(self._on_roi_progress)
+        self.roi_pipeline.finished_signal.connect(self._on_roi_finished)
+        self.roi_pipeline.error_signal.connect(self._on_roi_error)
+        self.roi_pipeline.start()
 
-    def _on_seg_progress(self, percent, message):
-        self.seg_progress_bar.setValue(percent)
-        self.seg_progress_label.setText(message)
+    def on_roi_cancel(self):
+        if self.roi_pipeline and self.roi_pipeline.isRunning():
+            self.roi_pipeline.cancel()
+            self.roi_progress_label.setText("正在取消...")
+            self.roi_btn_cancel.setEnabled(False)
 
-    def _on_seg_finished(self, result):
-        self.seg_btn_start.setEnabled(True)
-        self.seg_btn_cancel.setEnabled(False)
-        self.seg_btn_clear.setEnabled(True)
-        self.seg_result = result
+    def _on_roi_task_changed(self, index):
+        pass
 
-        stats = result["stats"]
-        stats_text = (
-            f"总血管体积: {stats['volume_cm3']:.1f} cm³ | "
-            f"体素: {stats['total_voxels']:,} | "
-            f"连通域: {stats['num_components']} | "
-            f"最大域: {stats['largest_component']:,}"
+    def on_roi_clear(self):
+        self.roi_results = None
+        self.roi_tree.clear()
+        self.roi_results_label.setText("")
+        self.roi_btn_clear.setEnabled(False)
+        self.roi_progress_bar.setValue(0)
+        self.roi_progress_label.setText("就绪")
+        self.roi_progress_log.clear()
+        self._restore_vr_pixels()
+        self.iren.Render()
+
+    def _on_roi_progress(self, percent, message):
+        self.roi_progress_bar.setValue(percent)
+        self.roi_progress_label.setText(message)
+        self.roi_progress_log.append(message)
+
+    def _on_roi_finished(self, region_results, label_map=None):
+        self.roi_btn_start.setEnabled(True)
+        self.roi_btn_cancel.setEnabled(False)
+        self.roi_btn_clear.setEnabled(True)
+        self.roi_results = region_results
+
+        all_bones = []
+        all_vessels = []
+        all_tissues = []
+        for r in region_results:
+            all_bones.extend(r.bones)
+            all_vessels.extend(r.vessels)
+            all_tissues.extend(r.tissues)
+
+        total_bone_v = sum(b.voxel_count for b in all_bones)
+        total_vessel_v = sum(b.voxel_count for b in all_vessels)
+        total_tissue_v = sum(b.voxel_count for b in all_tissues)
+        self.roi_results_label.setText(
+            f"骨骼 {len(all_bones)} 类 {total_bone_v/1e6:.1f}M vox | "
+            f"血管 {len(all_vessels)} 类 {total_vessel_v/1e6:.1f}M vox | "
+            f"软组织 {len(all_tissues)} 类 {total_tissue_v/1e6:.1f}M vox | "
+            "选择列表项可将Unet识别结果叠加在原始VR图上"
         )
-        self.seg_stats_label.setText(stats_text)
-        self.seg_stats_group.setVisible(True)
 
-        if self.seg_visualizer is None:
-            self.seg_visualizer = SegmentationVisualizer(self.renderer)
+        self.roi_tree.clear()
+        self.roi_tree.blockSignals(True)
+        for cat_name, blocks, color in [
+            ("骨骼 (Bone)", all_bones, (0.90, 0.88, 0.80)),
+            ("血管 (Vessel)", all_vessels, (0.80, 0.15, 0.15)),
+            ("软组织 (Tissue)", all_tissues, (0.15, 0.60, 0.35)),
+        ]:
+            if not blocks:
+                continue
+            cat_vol = sum(b.volume_cm3 for b in blocks)
+            cat_item = QtWidgets.QTreeWidgetItem([
+                cat_name, f"{cat_vol:.1f}", f"共 {len(blocks)} 项"
+            ])
+            cat_item.setToolTip(0, cat_name)
+            font = cat_item.font(0)
+            font.setBold(True)
+            cat_item.setFont(0, font)
+            cat_item.setBackground(0, QColor(int(color[0]*40), int(color[1]*40), int(color[2]*40)))
+            cat_item.setFlags(cat_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            self.roi_tree.addTopLevelItem(cat_item)
 
-        if self.seg_check_surface.isChecked():
-            self.seg_visualizer.add_vessel_surface(
-                result["mask"], result["spacing"], result["origin"]
-            )
-        elif self.seg_check_volume.isChecked():
-            self.seg_visualizer.add_vessel_volume(
-                result["mask"], result["spacing"], result["origin"]
-            )
+            blocks_sorted = sorted(blocks, key=lambda b: b.volume_cm3, reverse=True)
+            for block in blocks_sorted:
+                dname = block.anatomical_name or block.category
+                sub = QtWidgets.QTreeWidgetItem([
+                    f"  {dname}", f"{block.volume_cm3:.1f}", block.region
+                ])
+                sub.setToolTip(0, dname)
+                sub.setToolTip(2, block.region)
+                sub.setData(0, QtCore.Qt.ItemDataRole.UserRole, block)
+                cat_item.addChild(sub)
+            cat_item.setExpanded(True)
+        self.roi_tree.blockSignals(False)
+        self._restore_vr_pixels()
+
+        self.roi_progress_bar.setValue(100)
+        self.roi_progress_label.setText(
+            f"完成: {len(all_bones)+len(all_vessels)+len(all_tissues)} 个解剖结构"
+        )
+        self.render_window.Render()
+
+    def _blocks_from_tree_item(self, item):
+        block = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        if block is not None:
+            return [block]
+
+        blocks = []
+        for idx in range(item.childCount()):
+            child = item.child(idx)
+            child_block = child.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            if child_block is not None:
+                blocks.append(child_block)
+        return blocks
+
+    def _on_roi_tree_selection_changed(self):
+        selected_blocks = []
+        seen = set()
+        for item in self.roi_tree.selectedItems():
+            for block in self._blocks_from_tree_item(item):
+                key = (block.label_id, block.region, block.bbox_z, block.bbox_y, block.bbox_x)
+                if key in seen:
+                    continue
+                seen.add(key)
+                selected_blocks.append(block)
+
+        if selected_blocks:
+            self._apply_roi_pixel_replacement(selected_blocks)
         else:
-            self.seg_visualizer.add_vessel_surface(
-                result["mask"], result["spacing"], result["origin"]
-            )
+            self._restore_vr_pixels()
+        self.render_window.Render()
 
-        self.seg_progress_label.setText("分割完成")
-
-        if self.image_data is not None and result["mask"].sum() > 0:
-            self._render_right_masked_ct(result)
-
-        self.iren.Render()
-
-    def _on_seg_error(self, error_msg):
-        self.seg_btn_start.setEnabled(True)
-        self.seg_btn_cancel.setEnabled(False)
-        self.seg_progress_label.setText(f"错误: {error_msg}")
-        QtWidgets.QMessageBox.critical(self, "分割失败", error_msg)
-
-    def _on_seg_vis_change(self):
-        if self.seg_result is None or self.seg_visualizer is None:
-            return
-        self.seg_visualizer.remove_all()
-        if self.seg_check_surface.isChecked():
-            self.seg_visualizer.add_vessel_surface(
-                self.seg_result["mask"],
-                self.seg_result["spacing"],
-                self.seg_result["origin"],
-            )
-        elif self.seg_check_volume.isChecked():
-            self.seg_visualizer.add_vessel_volume(
-                self.seg_result["mask"],
-                self.seg_result["spacing"],
-                self.seg_result["origin"],
-            )
-        self.iren.Render()
-
-    def _render_right_masked_ct(self, result):
-        mask = result["mask"].astype(np.uint8)
-        spacing = result["spacing"]
-        origin = result["origin"]
-        shape = mask.shape
-
-        vtk_img = vtk.vtkImageData()
-        vtk_img.SetDimensions(shape[2], shape[1], shape[0])
-        vtk_img.SetSpacing(spacing)
-        vtk_img.SetOrigin(origin)
-        flat = mask.ravel(order="C")
-        vtk_arr = numpy_support.numpy_to_vtk(flat, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
-        vtk_img.GetPointData().SetScalars(vtk_arr)
-
-        if self.right_volume:
-            self.seg_renderer.RemoveVolume(self.right_volume)
-
-        self.right_producer = vtk.vtkTrivialProducer()
-        self.right_producer.SetOutput(vtk_img)
-
-        self.right_mapper = vtk.vtkGPUVolumeRayCastMapper()
-        self.right_mapper.SetInputConnection(self.right_producer.GetOutputPort())
-        self.right_mapper.SetBlendModeToComposite()
-
-        ofun = vtk.vtkPiecewiseFunction()
-        ofun.AddPoint(0, 0.0)
-        ofun.AddPoint(1, 0.6)
-        cfun = vtk.vtkColorTransferFunction()
-        cfun.AddRGBPoint(0, 0.0, 0.0, 0.0)
-        cfun.AddRGBPoint(1, 1.0, 0.25, 0.15)
-
-        right_prop = vtk.vtkVolumeProperty()
-        right_prop.SetScalarOpacity(ofun)
-        right_prop.SetColor(cfun)
-        right_prop.SetInterpolationTypeToLinear()
-        right_prop.ShadeOn()
-        right_prop.SetAmbient(0.2)
-        right_prop.SetDiffuse(0.8)
-        right_prop.SetSpecular(0.1)
-        right_prop.SetSpecularPower(5.0)
-
-        self.right_volume = vtk.vtkVolume()
-        self.right_volume.SetMapper(self.right_mapper)
-        self.right_volume.SetProperty(right_prop)
-        self.seg_renderer.AddVolume(self.right_volume)
+    def _on_roi_error(self, error_msg):
+        self.roi_btn_start.setEnabled(True)
+        self.roi_btn_cancel.setEnabled(False)
+        self.roi_progress_label.setText(f"错误: {error_msg}")
+        self._restore_vr_pixels()
+        QtWidgets.QMessageBox.critical(self, "ROI检测失败", error_msg)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="PySide6 SSD+VR DICOM viewer (Figure 8 style fusion).")
     parser.add_argument("--input", default="", help="DICOM folder path or a single DICOM file")
     args = parser.parse_args()
+
+    local_weights = os.path.join(os.path.dirname(os.path.abspath(__file__)), "totalseg_weights")
+    if os.path.isdir(local_weights):
+        os.environ["nnUNet_results"] = local_weights
+
+    DEFAULT_INPUT = r"K:\1.2.156.14702.1.1032.512.0.20250314234918296\good\04_Upper_Abdomen"
+    initial = args.input.strip() or DEFAULT_INPUT
 
     set_appearance_mode("dark")
     theme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scientific.json")
@@ -3671,8 +4046,13 @@ def main() -> int:
     with open(qss_path, "r", encoding="utf-8") as f:
         app.setStyleSheet(f.read())
 
-    win = ViewerWindow(initial_input=args.input.strip())
+    win = ViewerWindow(initial_input=initial)
     win.show()
+
+    if os.path.isdir(initial) or os.path.isfile(initial):
+        QtCore.QTimer.singleShot(400, win.load_dicom)
+        QtCore.QTimer.singleShot(5000, lambda: win.pages.setCurrentIndex(1))
+
     return app.exec()
 
 
