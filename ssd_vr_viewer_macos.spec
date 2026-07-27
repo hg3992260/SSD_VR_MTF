@@ -10,22 +10,26 @@ vtk_datas, vtk_bins, vtk_hidden = collect_all('vtkmodules')
 # – SimpleITK
 sitk_datas, sitk_bins, sitk_hidden = collect_all('SimpleITK')
 
-# – Qt plugins: PySide6's native hook collects them,
-#   but with conda VTK's Qt libraries, the path may conflict.
-#   Force collect PySide6 Qt plugins explicitly.
+# – Qt plugins: copy .dylib files as binaries (preserving codesign/rpath)
 import PySide6
 pyside6_root = Path(PySide6.__path__[0])
 qt_plugins = pyside6_root / 'Qt' / 'plugins'
 extra_datas = []
+extra_bins = list(pct6_bins) + list(vtk_bins) + list(sitk_bins)
 if qt_plugins.exists():
     for d in qt_plugins.iterdir():
-        if d.is_dir():
-            extra_datas.append((str(d), f'PySide6/Qt/plugins/{d.name}'))
+        if not d.is_dir():
+            continue
+        for f in d.iterdir():
+            if f.suffix in ('.dylib', '.so'):
+                dest = f'PySide6/Qt/plugins/{d.name}/{f.name}'
+                extra_bins.append((str(f), dest))
+
 
 a = Analysis(
     ['ssd_vr_viewer.py'],
     pathex=[],
-    binaries=pct6_bins + vtk_bins + sitk_bins,
+    binaries=extra_bins,
     datas=pct6_datas + vtk_datas + sitk_datas + extra_datas + [
         ('scientific.json', '.'),
         ('dark.qss', '.'),
