@@ -56,6 +56,7 @@ a = Analysis(
 
 # Exclude standalone libQt6*.dylib to avoid conflict with PySide6 framework Qt
 from PyInstaller.building.datastruct import TOC
+import PySide6
 a.binaries = TOC([t for t in a.binaries
                   if not t[0].startswith('libQt6')])
 

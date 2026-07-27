@@ -49,8 +49,9 @@ ER_DLL_PATH = os.path.join(current_dir, "exposure-render-master", "exposure-rend
 er_core = None
 if os.path.exists(ER_DLL_PATH):
     try:
-        # Load the directory first to satisfy CUDA runtime dependencies if any
-        os.add_dll_directory(os.path.dirname(ER_DLL_PATH))
+        # Load the directory first to satisfy CUDA runtime dependencies if any (Windows only)
+        if sys.platform == "win32":
+            os.add_dll_directory(os.path.dirname(ER_DLL_PATH))
         er_core = ctypes.CDLL(ER_DLL_PATH)
         er_core.er_create_tracer.restype = ctypes.c_void_p
         er_core.er_create_volume.restype = ctypes.c_void_p
