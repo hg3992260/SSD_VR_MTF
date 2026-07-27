@@ -16,8 +16,8 @@ from typing import List, Tuple
 # ============================================================
 # CONFIG (EDIT FOR YOUR PATHS)
 # ============================================================
-DICOM_DIR = r"D:\xl\00020006\00020006"
-OUTPUT_DIR = r"C:\Users\chris\Desktop\SSD+VR\kedge_output"
+DICOM_DIR = os.environ.get("DICOM_DIR", "")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.expanduser("~/ssd_vr_kedge_output"))
 RECON_SIZE = 1024
 RECON_NX = RECON_SIZE
 RECON_NY = RECON_SIZE

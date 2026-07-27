@@ -3,31 +3,33 @@ import importlib.util
 import os
 import sys
 
-# Inject the pv_packages directory into sys.path to allow pvpython to find PyQt5 and SimpleITK
 current_dir = os.path.dirname(os.path.abspath(__file__))
-pv_packages_dir = os.path.join(current_dir, "pv_packages")
-sys.path.insert(0, pv_packages_dir)
 
-# Add the DLL directory for PyQt5 and pv_packages
-pyqt5_qt5_bin = os.path.join(pv_packages_dir, "PyQt5", "Qt5", "bin")
-pyqt5_root = os.path.join(pv_packages_dir, "PyQt5")
-if hasattr(os, "add_dll_directory"):
-    if os.path.exists(pyqt5_qt5_bin):
-        os.add_dll_directory(pyqt5_qt5_bin)
-    if os.path.exists(pyqt5_root):
-        os.add_dll_directory(pyqt5_root)
-    if os.path.exists(pv_packages_dir):
-        os.add_dll_directory(pv_packages_dir)
-os.environ["PATH"] = pyqt5_qt5_bin + os.pathsep + pyqt5_root + os.pathsep + pv_packages_dir + os.pathsep + os.environ.get("PATH", "")
+# Inject the pv_packages directory into sys.path to allow pvpython to find PyQt5 and SimpleITK
+if sys.platform == "win32":
+    pv_packages_dir = os.path.join(current_dir, "pv_packages")
+    sys.path.insert(0, pv_packages_dir)
 
-# Ensure PyQt5 uses its own plugins instead of ParaView's Qt plugins
-qt_plugins_dir = os.path.join(pyqt5_root, "Qt5", "plugins")
-if os.path.exists(qt_plugins_dir):
-    os.environ["QT_PLUGIN_PATH"] = qt_plugins_dir
-    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(qt_plugins_dir, "platforms")
-    # Tell PyQt5 to ignore ParaView's Qt6 environment variables
-    if "QT_ROOT" in os.environ:
-        del os.environ["QT_ROOT"]
+    # Add the DLL directory for PyQt5 and pv_packages
+    pyqt5_qt5_bin = os.path.join(pv_packages_dir, "PyQt5", "Qt5", "bin")
+    pyqt5_root = os.path.join(pv_packages_dir, "PyQt5")
+    if hasattr(os, "add_dll_directory"):
+        if os.path.exists(pyqt5_qt5_bin):
+            os.add_dll_directory(pyqt5_qt5_bin)
+        if os.path.exists(pyqt5_root):
+            os.add_dll_directory(pyqt5_root)
+        if os.path.exists(pv_packages_dir):
+            os.add_dll_directory(pv_packages_dir)
+    os.environ["PATH"] = pyqt5_qt5_bin + os.pathsep + pyqt5_root + os.pathsep + pv_packages_dir + os.pathsep + os.environ.get("PATH", "")
+
+    # Ensure PyQt5 uses its own plugins instead of ParaView's Qt plugins
+    qt_plugins_dir = os.path.join(pyqt5_root, "Qt5", "plugins")
+    if os.path.exists(qt_plugins_dir):
+        os.environ["QT_PLUGIN_PATH"] = qt_plugins_dir
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(qt_plugins_dir, "platforms")
+        # Tell PyQt5 to ignore ParaView's Qt6 environment variables
+        if "QT_ROOT" in os.environ:
+            del os.environ["QT_ROOT"]
 
 # Suppress Qt6 invalid metadata warnings from ParaView's DLLs
 os.environ["QT_LOGGING_RULES"] = "qt.core.plugin.loader.warning=false;qt.core.library.warning=false"
@@ -37,7 +39,13 @@ from typing import List, Optional, Tuple
 
 import ctypes
 
-ER_DLL_PATH = os.path.join(current_dir, "exposure-render-master", "exposure-render-master", "Source", "build", "Release", "ErCore.dll")
+if sys.platform == "darwin":
+    _er_ext = ".dylib"
+elif sys.platform == "win32":
+    _er_ext = ".dll"
+else:
+    _er_ext = ".so"
+ER_DLL_PATH = os.path.join(current_dir, "exposure-render-master", "exposure-render-master", "Source", "build", "Release", f"ErCore{_er_ext}")
 er_core = None
 if os.path.exists(ER_DLL_PATH):
     try:
@@ -1795,7 +1803,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         kedge_layout = QtWidgets.QVBoxLayout(kedge_page)
 
         kedge_path_row = QtWidgets.QHBoxLayout()
-        self.kedge_dir_edit = CLineEdit(master=kedge_page, width=280, text=r"C:\Users\chris\Desktop\SSD+VR\kedge_output")
+        self.kedge_dir_edit = CLineEdit(master=kedge_page, width=280, text=os.path.expanduser("~/ssd_vr_kedge_output"))
         self.btn_run_kedge = CButton(master=kedge_page, width=120, text="运行 K-edge 预处理", command=self._run_kedge_preprocess)
         self.btn_load_kedge = CButton(master=kedge_page, width=80, text="加载 NIfTI", command=self._load_kedge_data)
         kedge_path_row.addWidget(QtWidgets.QLabel("K-edge 目录:"))
@@ -2873,6 +2881,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.render_window.Render()
 
     def on_mode_change(self, index: int) -> None:
+        if index in (10, 11) and er_core is None:
+            QtWidgets.QMessageBox.information(self, "不可用", "Exposure Render (CUDA) 在此平台不可用。\n需要 NVIDIA GPU + CUDA + ErCore 编译库。")
+            self.mode_combo.combo_box().setCurrentIndex(0)
+            return
         if index == 11:
             self.render_mode = "dual_volume"
         elif index == 10:
