@@ -4025,6 +4025,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
 
 def main() -> int:
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+
     parser = argparse.ArgumentParser(description="PySide6 SSD+VR DICOM viewer (Figure 8 style fusion).")
     parser.add_argument("--input", default="", help="DICOM folder path or a single DICOM file")
     args = parser.parse_args()
@@ -4033,8 +4038,7 @@ def main() -> int:
     if os.path.isdir(local_weights):
         os.environ["nnUNet_results"] = local_weights
 
-    DEFAULT_INPUT = r"K:\1.2.156.14702.1.1032.512.0.20250314234918296\good\04_Upper_Abdomen"
-    initial = args.input.strip() or DEFAULT_INPUT
+    initial = args.input.strip()
 
     set_appearance_mode("dark")
     theme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scientific.json")
