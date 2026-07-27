@@ -59,6 +59,17 @@ from PyInstaller.building.datastruct import TOC
 a.binaries = TOC([t for t in a.binaries
                   if not t[0].startswith('libQt6')])
 
+# Re-add PySide6 platform plugins (may be lost when hook's Qt ref is filtered)
+pyside6_root = Path(PySide6.__path__[0])
+_platforms = pyside6_root / 'Qt' / 'plugins' / 'platforms'
+_existing = {t[0] for t in a.binaries}
+if _platforms.exists():
+    for f in _platforms.iterdir():
+        if f.suffix in ('.dylib',):
+            dest = f'PySide6/Qt/plugins/platforms/{f.name}'
+            if dest not in _existing:
+                a.binaries.append((dest, str(f), 'BINARY'))
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
