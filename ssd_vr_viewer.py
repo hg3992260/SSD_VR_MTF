@@ -4042,6 +4042,17 @@ def main() -> int:
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w")
 
+    if sys.platform == "darwin" and getattr(sys, "frozen", False):
+        res_dir = os.path.join(os.path.dirname(sys.executable), "..", "Resources")
+        plugin_path = os.path.join(res_dir, "PySide6", "Qt", "plugins")
+        if os.path.isdir(plugin_path):
+            os.environ["QT_PLUGIN_PATH"] = plugin_path
+            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(plugin_path, "platforms")
+        lib_path = os.path.join(res_dir, "PySide6", "Qt", "lib")
+        if os.path.isdir(lib_path):
+            current_dyld = os.environ.get("DYLD_LIBRARY_PATH", "")
+            os.environ["DYLD_LIBRARY_PATH"] = lib_path + (":" + current_dyld if current_dyld else "")
+
     parser = argparse.ArgumentParser(description="PySide6 SSD+VR DICOM viewer (Figure 8 style fusion).")
     parser.add_argument("--input", default="", help="DICOM folder path or a single DICOM file")
     args = parser.parse_args()
