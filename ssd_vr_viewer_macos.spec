@@ -13,6 +13,13 @@ sitk_datas, sitk_bins, sitk_hidden = collect_all('SimpleITK')
 extra_datas = []
 extra_bins = list(pct6_bins) + list(vtk_bins) + list(sitk_bins)
 
+# Filter standalone Qt dylibs to avoid conflict with PySide6's framework Qt
+import fnmatch
+_qt_standalone = {'libQt6Core*.dylib','libQt6Gui*.dylib','libQt6Widgets*.dylib',
+                  'libQt6DBus*.dylib','libQt6Network*.dylib'}
+extra_bins = [(src,dst) for src,dst in extra_bins
+              if not any(fnmatch.fnmatch(dst.split('/')[-1], p) for p in _qt_standalone)]
+
 
 a = Analysis(
     ['ssd_vr_viewer.py'],
@@ -46,6 +53,11 @@ a = Analysis(
               'PySide6.QtNetwork','PySide6.QtDBus'],
     noarchive=False,
 )
+
+# Exclude standalone libQt6*.dylib to avoid conflict with PySide6 framework Qt
+from PyInstaller.building.datastruct import TOC
+a.binaries = TOC([t for t in a.binaries
+                  if not t[0].startswith('libQt6')])
 
 pyz = PYZ(a.pure)
 
