@@ -10,7 +10,7 @@ vtk_datas, vtk_bins, vtk_hidden = collect_all('vtkmodules')
 # – SimpleITK
 sitk_datas, sitk_bins, sitk_hidden = collect_all('SimpleITK')
 
-# – Qt plugins: copy .dylib files as binaries (preserving codesign/rpath)
+# – Qt platform plugins: only collect 'platforms' to avoid dupes with PySide6 hook
 import PySide6
 pyside6_root = Path(PySide6.__path__[0])
 qt_plugins = pyside6_root / 'Qt' / 'plugins'
@@ -18,7 +18,7 @@ extra_datas = []
 extra_bins = list(pct6_bins) + list(vtk_bins) + list(sitk_bins)
 if qt_plugins.exists():
     for d in qt_plugins.iterdir():
-        if not d.is_dir():
+        if not d.is_dir() or d.name not in ('platforms',):
             continue
         for f in d.iterdir():
             if f.suffix in ('.dylib', '.so'):
@@ -42,19 +42,13 @@ a = Analysis(
         'PyCt6.widgets.c_button','PyCt6.widgets.c_label','PyCt6.widgets.c_line_edit',
         'PyCt6.widgets.c_combo_box','PyCt6.widgets.c_slider','PyCt6.widgets.c_frame',
         'PyCt6.widgets.c_text_edit',
-        'PyCt6.windows.c_main_window','PyCt6.windows.c_toplevel',
+        'PyCt6.windows.c_main_window',
         'PyCt6.appearance.theme_manager','PyCt6.appearance.mode_manager',
         'PySide6.QtCore','PySide6.QtGui','PySide6.QtWidgets',
         'PySide6.QtOpenGL','PySide6.QtOpenGLWidgets','PySide6.QtSvg',
         'vtkmodules.qt.QVTKRenderWindowInteractor','vtkmodules.util.numpy_support',
-        'vtkRenderingOpenGL2','vtkRenderingVolumeOpenGL2',
         'scipy.ndimage','skimage.restoration','skimage.filters',
         'nibabel','nibabel.nifti1',
-        'totalsegmentator',
-        'totalsegmentator.python_api','totalsegmentator.libs','totalsegmentator.nnunet',
-        'totalsegmentator.custom_trainers','totalsegmentator.roi_refinement',
-        'nnunetv2','nnunetv2.training',
-        'nnunetv2.training.nnUNetTrainer.variants.training_length.nnUNetTrainer_Xepochs_NoMirroring',
     ],
     hookspath=[],
     hooksconfig={},
