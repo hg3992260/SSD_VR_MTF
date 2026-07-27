@@ -10,20 +10,8 @@ vtk_datas, vtk_bins, vtk_hidden = collect_all('vtkmodules')
 # – SimpleITK
 sitk_datas, sitk_bins, sitk_hidden = collect_all('SimpleITK')
 
-# – Qt platform plugins: only collect 'platforms' to avoid dupes with PySide6 hook
-import PySide6
-pyside6_root = Path(PySide6.__path__[0])
-qt_plugins = pyside6_root / 'Qt' / 'plugins'
 extra_datas = []
 extra_bins = list(pct6_bins) + list(vtk_bins) + list(sitk_bins)
-if qt_plugins.exists():
-    for d in qt_plugins.iterdir():
-        if not d.is_dir() or d.name not in ('platforms',):
-            continue
-        for f in d.iterdir():
-            if f.suffix in ('.dylib', '.so'):
-                dest = f'PySide6/Qt/plugins/{d.name}/{f.name}'
-                extra_bins.append((str(f), dest))
 
 
 a = Analysis(
