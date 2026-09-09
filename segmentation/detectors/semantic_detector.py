@@ -18,7 +18,9 @@ def detect_semantic(
 ) -> np.ndarray:
 
     min_sp = min(spacing_original)
-    need_resample = min_sp < 0.8
+    # brain_structures 用官方 0.5mm 模型, 由 TS 内部处理重采样, 不预降采样到 1.5mm
+    hi_res_task = task == "brain_structures"
+    need_resample = (not hi_res_task) and min_sp < 0.8
     target_sp = (1.5, 1.5, 1.5)
 
     # #region debug-point A:semantic-input
@@ -76,9 +78,12 @@ def detect_semantic(
     nii_path = os.path.join(tmpdir, "input.nii.gz")
     sitk.WriteImage(resampled, nii_path)
 
+    _apply_nnunet_serial_patches()
     from totalsegmentator.python_api import totalsegmentator
     import nnunetv2.training.nnUNetTrainer.variants.training_length.nnUNetTrainer_Xepochs_NoMirroring  # PyInstaller hook
-    seg_nifti = totalsegmentator(nii_path, task=task, fast=True, device="gpu", quiet=True, output_type="nifti")
+    # brain_structures (Dataset409) 等任务不支持 --fast; 按任务自动选择
+    fast = task in ("total", "total_v3", "total_mr", "body")
+    seg_nifti = totalsegmentator(nii_path, task=task, fast=fast, device="gpu", quiet=True, output_type="nifti")
 
     out_nii = os.path.join(tmpdir, "seg.nii.gz")
     import nibabel as nib
@@ -153,6 +158,75 @@ def detect_semantic(
         pass
 
     return label_map
+
+
+def _apply_nnunet_serial_patches():
+    """Windows/GUI 兼容补丁：nnU-Net 推理路径里的 multiprocessing.Pool（spawn）在
+    Qt 线程/非 __main__ 上下文调用会无限 crash-loop（worker 重导入整个 GUI），
+    导致 GPU 推理无法启动。这里把两处 Pool 替换为串行实现。"""
+    try:
+        import nnunetv2.inference.predict_from_raw_data as pfr
+        import nnunetv2.utilities.utils as u
+        from batchgenerators.utilities.file_operations import subfiles
+
+        if getattr(u.create_lists_from_splitted_dataset_folder, "_serial_patched", False):
+            return
+        u.create_paths_fn = u.create_paths_fn  # keep reference stable
+
+        def _create_lists_serial(folder, file_ending, identifiers=None, num_processes=12):
+            if identifiers is None:
+                identifiers = u.get_identifiers_from_splitted_dataset_folder(folder, file_ending)
+            files = subfiles(folder, suffix=file_ending, join=False, sort=True)
+            return [u.create_paths_fn(folder, files, file_ending, f) for f in identifiers]
+
+        _create_lists_serial._serial_patched = True
+        u.create_lists_from_splitted_dataset_folder = _create_lists_serial
+        pfr.create_lists_from_splitted_dataset_folder = _create_lists_serial
+
+        def _predict_from_data_iterator_serial(self, data_iterator, save_probabilities=False,
+                                               num_processes_segmentation_export=1):
+            import os
+            import numpy as np
+            import torch
+            from nnunetv2.inference.predict_from_raw_data import (
+                convert_predicted_logits_to_segmentation_with_correct_shape,
+                export_prediction_from_logits,
+            )
+            ret = []
+            for preprocessed in data_iterator:
+                data = preprocessed["data"]
+                if isinstance(data, str):
+                    delfile = data
+                    data = torch.from_numpy(np.load(data))
+                    os.remove(delfile)
+                ofile = preprocessed["ofile"]
+                properties = preprocessed["data_properties"]
+                prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+                if ofile is not None:
+                    ret.append(export_prediction_from_logits(
+                        prediction, properties, self.configuration_manager,
+                        self.plans_manager, self.dataset_json, ofile, save_probabilities))
+                else:
+                    ret.append(convert_predicted_logits_to_segmentation_with_correct_shape(
+                        prediction, self.plans_manager, self.configuration_manager,
+                        self.label_manager, properties, save_probabilities))
+            if hasattr(data_iterator, "_finish"):
+                try:
+                    data_iterator._finish()
+                except Exception:
+                    pass
+            try:
+                from nnunetv2.inference.data_iterators import compute_gaussian
+                from nnunetv2.utilities.helpers import empty_cache
+                compute_gaussian.cache_clear()
+                empty_cache(self.device)
+            except Exception:
+                pass
+            return ret
+
+        pfr.nnUNetPredictor.predict_from_data_iterator = _predict_from_data_iterator_serial
+    except Exception:
+        pass
 
 
 def _resample(image: sitk.Image, target_spacing: tuple) -> sitk.Image:

@@ -206,7 +206,7 @@ from PyCt6 import (
     CButton, CLabel, CLineEdit, CTextEdit, CComboBox, CSlider, CFrame,
     set_appearance_mode, set_color_theme
 )
-from PySide6.QtGui import QPainter, QColor, QIcon
+from PySide6.QtGui import QPainter, QColor, QIcon, QImage, QPixmap, QPen
 
 import SimpleITK as sitk
 import tempfile
@@ -946,6 +946,57 @@ class RangeSlider(QtWidgets.QWidget):
         self._active_handle = None
 
 
+class SamSliceLabel(QtWidgets.QLabel):
+    """带点击/右键信号的切片视图标签（轴号随事件带出）。
+
+    保持原始像素纵横比显示：图片按 label 大小等比缩放并居中（不拉伸），
+    记录实际绘制矩形供点击坐标换算。
+    """
+    clicked = QtCore.Signal(int, object)  # (axis, QMouseEvent)
+
+    def __init__(self, axis: int, parent=None):
+        super().__init__(parent)
+        self.axis = axis
+        self._src = None          # 原始像素图
+        self._disp = QtCore.QRect()  # 实际绘制区域(相对 label)
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.setScaledContents(False)
+
+    def set_source(self, pix) -> None:
+        """保存源图并按当前尺寸等比显示。"""
+        self._src = pix
+        self._apply_scale()
+
+    def source_pixmap(self):
+        return self._src
+
+    def display_rect(self) -> QtCore.QRect:
+        """当前实际绘制矩形（未画图时为空）。"""
+        return QtCore.QRect(self._disp)
+
+    def _apply_scale(self) -> None:
+        if self._src is None:
+            return
+        w, h = self.width(), self.height()
+        self._disp = QtCore.QRect()
+        if w <= 2 or h <= 2 or self._src.isNull():
+            self.setPixmap(QPixmap() if self._src is None else self._src)
+            return
+        scaled = self._src.scaled(w, h, QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                                  QtCore.Qt.TransformationMode.SmoothTransformation)
+        sw, sh = scaled.width(), scaled.height()
+        self._disp = QtCore.QRect((w - sw) // 2, (h - sh) // 2, sw, sh)
+        self.setPixmap(scaled)
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        self._apply_scale()
+
+    def mousePressEvent(self, ev):
+        self.clicked.emit(self.axis, ev)
+        super().mousePressEvent(ev)
+
+
 class ViewerWindow(QtWidgets.QMainWindow):
     def __init__(self, initial_input: Optional[str] = None) -> None:
         super().__init__()
@@ -956,6 +1007,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.resize(1520, 920)
 
         self.initial_input = initial_input or ""
+        self.load_busy = False
+        self.last_error = None
+        self._mcp_mode = False
+        self._mcp_bridge = None
+        # ---- 3D SAM 交互分割状态 ----
+        self.sam_session = None
+        self.sam_pos_pts = []   # [(z,y,x), ...] 正点（VR 网格坐标）
+        self.sam_neg_pts = []   # [(z,y,x), ...] 负点
+        self.sam_mask = None    # np.bool (D,H,W) 最近一次 SAM 结果
+        self.sam_busy = False
+        self.sam_pending = False
+        self._sam_refreshing = False
         self.controller = None  # type: Optional[FusionController]
         self.current_ssd_volume = None  # type: Optional[vtk.vtkVolume]
         self.current_vr_volume = None  # type: Optional[vtk.vtkVolume]
@@ -1028,6 +1091,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         self.slicer_presets = {}
         self._load_slicer_presets()
+
+    def _mcp_push(self, etype, data):
+        bridge = getattr(self, "_mcp_bridge", None)
+        if bridge is not None:
+            try:
+                bridge.push_event(etype, data)
+            except Exception:
+                pass
 
     def _load_slicer_presets(self):
         import xml.etree.ElementTree as ET
@@ -1758,6 +1829,21 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.roi_weight_status = QtWidgets.QLabel("")
         self.roi_weight_status.setStyleSheet("font-size: 10px; color: #88b0c8;")
         roi_config_layout.addWidget(self.roi_weight_status)
+        task_row = QtWidgets.QHBoxLayout()
+        task_row.addWidget(QtWidgets.QLabel("分割任务:"))
+        self.roi_task_combo = QtWidgets.QComboBox()
+        for text, key in [
+            ("total (CT 全身 117类)", "total"),
+            ("total_v3 (CT v3)", "total_v3"),
+            ("total_mr (MRI 全身)", "total_mr"),
+            ("brain_structures (官方脑区16类, 含颞叶, 学术授权)", "brain_structures"),
+            ("SynthSeg (脑结构 DIPY, CT/MR)", "synthseg"),
+            ("颞叶 (解剖提取自SynthSeg, ⚠非官方)", "temporal_lobe"),
+        ]:
+            self.roi_task_combo.addItem(text, userData=key)
+        self.roi_task_combo.currentIndexChanged.connect(self._on_roi_task_changed)
+        task_row.addWidget(self.roi_task_combo, 1)
+        roi_config_layout.addLayout(task_row)
         self._cached_weight_tasks = {}  # {folder: task_name}
         self.roi_current_task = "total"
         roi_layout.addWidget(roi_config_group)
@@ -1821,6 +1907,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         kedge_layout.addLayout(kedge_path_row)
         kedge_layout.addLayout(mat_row)
+
+        # === 3D SAM 页（插入到 PCCT K-edge 之前）===
+        self._build_sam_tab()
+
         self.pages.addTab(kedge_page, "PCCT K-edge")
 
         # Split layout: left=tabs+controls, right=VTK render
@@ -1884,18 +1974,26 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.render_window.SetNumberOfLayers(3)
         self.pages.currentChanged.connect(self._on_tab_changed)
 
+    def _kedge_tab_index(self):
+        for i in range(self.pages.count()):
+            if "K-edge" in self.pages.tabText(i):
+                return i
+        return -1
+
     def _on_tab_changed(self, index: int) -> None:
-        if index in (0, 1):
-            self.renderer.SetViewport(0.0, 0.0, 1.0, 1.0)
-            self.seg_renderer.SetViewport(0.0, 0.0, 0.0, 1.0)
-            self.kedge_renderer.SetViewport(0.0, 0.0, 0.0, 1.0)
-        else:
+        # 仅 PCCT K-edge 页使用左右分屏（左=VR，右=K-edge 渲染）；
+        # 其余页（渲染/ROI/3D SAM）VR 独占整窗，不显示右侧额外框。
+        if index == self._kedge_tab_index():
             self.renderer.SetViewport(0.0, 0.0, 0.5, 1.0)
             self.seg_renderer.SetViewport(0.0, 0.0, 0.0, 1.0)
             self.kedge_renderer.SetViewport(0.5, 0.0, 1.0, 1.0)
             cam = self.renderer.GetActiveCamera()
             if cam:
                 self.kedge_renderer.SetActiveCamera(cam)
+        else:
+            self.renderer.SetViewport(0.0, 0.0, 1.0, 1.0)
+            self.seg_renderer.SetViewport(0.0, 0.0, 0.0, 1.0)
+            self.kedge_renderer.SetViewport(0.0, 0.0, 0.0, 1.0)
         self.iren.Render()
 
     def _run_kedge_preprocess(self) -> None:
@@ -2883,7 +2981,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def on_mode_change(self, index: int) -> None:
         if index in (10, 11) and er_core is None:
-            QtWidgets.QMessageBox.information(self, "不可用", "Exposure Render (CUDA) 在此平台不可用。\n需要 NVIDIA GPU + CUDA + ErCore 编译库。")
+            self.last_error = "Exposure Render (CUDA) 在此平台不可用，回退 stable"
+            self._mcp_push("error", {"error": self.last_error})
+            if not self._mcp_mode:
+                QtWidgets.QMessageBox.information(self, "不可用", "Exposure Render (CUDA) 在此平台不可用。\n需要 NVIDIA GPU + CUDA + ErCore 编译库。")
             self.mode_combo.combo_box().setCurrentIndex(0)
             return
         if index == 11:
@@ -3190,6 +3291,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         value = max(0, min(100, int(percent)))
         self.progress_bar.setValue(value)
         self.progress_text.append(message)
+        self._mcp_push("progress", {"percent": value, "message": message})
         QtWidgets.QApplication.processEvents()
 
     def _clear_old_volumes(self) -> None:
@@ -3491,9 +3593,19 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def load_dicom(self) -> None:
         dicom_path = self.path_edit.line_edit().text().strip()
         if not dicom_path or not os.path.exists(dicom_path):
-            QtWidgets.QMessageBox.warning(self, "路径无效", "请输入有效的 DICOM 路径。")
+            self.last_error = "路径无效: " + dicom_path
+            self._mcp_push("error", {"error": self.last_error})
+            if not self._mcp_mode:
+                QtWidgets.QMessageBox.warning(self, "路径无效", "请输入有效的 DICOM 路径。")
             return
 
+        if self.load_busy:
+            self.last_error = "load in progress: busy"
+            self._mcp_push("error", {"error": self.last_error, "load_busy": True})
+            return
+
+        self.load_busy = True
+        self._mcp_push("load_start", {"path": dicom_path})
         self._clear_old_volumes()
         self.btn_load.setEnabled(False)
         self.progress_text.clear()
@@ -3819,12 +3931,24 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 "左键：旋转 | 中键/Shift+左键：平移 | 右键：缩放 | 拖动裁剪框：实时剪裁。 SSD/VR 参数可独立调节。"
             )
+            dims = self.image_data.GetDimensions()
+            self._mcp_push("load_done", {
+                "path": dicom_path,
+                "dims": [int(v) for v in dims],
+                "spacing": [float(v) for v in self.image_data.GetSpacing()],
+            })
+            # 3D SAM：新数据到来时重置点/结果并同步切片范围
+            self._sam_reset()
         except Exception as exc:
             import traceback
             traceback.print_exc()
-            QtWidgets.QMessageBox.critical(self, "加载失败", f"DICOM 加载或渲染失败：\n{exc}")
+            self.last_error = f"DICOM 加载或渲染失败：{exc}"
+            self._mcp_push("error", {"error": self.last_error})
+            if not self._mcp_mode:
+                QtWidgets.QMessageBox.critical(self, "加载失败", f"DICOM 加载或渲染失败：\n{exc}")
             self.set_progress(0, "加载失败。")
         finally:
+            self.load_busy = False
             self.btn_load.setEnabled(True)
             QtWidgets.QApplication.restoreOverrideCursor()
 
@@ -3835,6 +3959,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         TASK_DEFS = {
             "total":     {"label": "total (v2 1.5mm) 1559例", "ids": {291,292,293,294,295,297}},
             "total_v3":  {"label": "total_v3 (v3 1.5mm) 1830例", "ids": {831,832,833,834,835,836}},
+            "total_mr":  {"label": "total_mr (MRI) 1088例", "ids": {850,851,852}},
+            "brain_structures": {"label": "brain_structures (脑区16类, 商业授权)", "ids": {409}},
         }
         found = set()
         for entry in os.listdir(path):
@@ -3866,10 +3992,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         tasks = self._scan_weight_dir(path)
         if not tasks:
-            self.roi_weight_status.setText("未检测到 TotalSegmentator 权重")
+            self.roi_weight_status.setText("未检测到 TotalSegmentator 权重（SynthSeg 任务无需权重）")
             return
 
         self.roi_current_task = tasks[0][1]
+        self._set_roi_task_combo(tasks[0][1])
         lines = "检测到: " + " · ".join(f"{lbl}" for lbl, _ in tasks)
         self.roi_weight_status.setText(lines)
         os.environ["nnUNet_results"] = path
@@ -3886,7 +4013,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def on_roi_start(self):
         if self.original_sitk_image is None or self.image_data is None:
-            QtWidgets.QMessageBox.warning(self, "无数据", "请先在渲染页面加载DICOM数据。")
+            self.last_error = "无数据：请先加载 DICOM"
+            self._mcp_push("roi_error", {"error": self.last_error})
+            if not self._mcp_mode:
+                QtWidgets.QMessageBox.warning(self, "无数据", "请先在渲染页面加载DICOM数据。")
             return
         self.roi_btn_start.setEnabled(False)
         self.roi_btn_cancel.setEnabled(True)
@@ -3894,10 +4024,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.roi_tree.clear()
         self.roi_results_label.setText("")
         self.roi_progress_bar.setValue(0)
-        self.roi_progress_label.setText("TotalSegmentator: 启动117类语义分割...")
+        self.roi_progress_label.setText(f"启动分割 (task={self.roi_current_task})...")
         self.roi_progress_log.clear()
         self._restore_vr_pixels()
         self.render_window.Render()
+        self._mcp_push("roi_start", {"task": self.roi_current_task})
 
         self.roi_pipeline = ROIPipeline(
             image_data=self.image_data,
@@ -3916,7 +4047,21 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.roi_btn_cancel.setEnabled(False)
 
     def _on_roi_task_changed(self, index):
-        pass
+        if index is None or index < 0:
+            return
+        task = self.roi_task_combo.itemData(index)
+        if task:
+            self.roi_current_task = task
+            self._mcp_push("state", {"roi_task": task})
+
+    def _set_roi_task_combo(self, task):
+        if not hasattr(self, "roi_task_combo"):
+            return
+        for i in range(self.roi_task_combo.count()):
+            if self.roi_task_combo.itemData(i) == task:
+                with QtCore.QSignalBlocker(self.roi_task_combo):
+                    self.roi_task_combo.setCurrentIndex(i)
+                return
 
     def on_roi_clear(self):
         self.roi_results = None
@@ -3933,6 +4078,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.roi_progress_bar.setValue(percent)
         self.roi_progress_label.setText(message)
         self.roi_progress_log.append(message)
+        self._mcp_push("progress", {"percent": percent, "message": message, "roi": True})
 
     def _on_roi_finished(self, region_results, label_map=None):
         self.roi_btn_start.setEnabled(True)
@@ -3998,6 +4144,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
             f"完成: {len(all_bones)+len(all_vessels)+len(all_tissues)} 个解剖结构"
         )
         self.render_window.Render()
+        self._mcp_push("roi_done", {
+            "bones": len(all_bones),
+            "vessels": len(all_vessels),
+            "tissues": len(all_tissues),
+            "total": len(all_bones) + len(all_vessels) + len(all_tissues),
+        })
+        # 自动同步：解剖结构统计 → 已保存 ROI 列表(轻量，不带大 mask)
+        try:
+            if hasattr(self, "sam_roi_table"):
+                self._sam_sync_roi_blocks(region_results)
+        except Exception:
+            pass
 
     def _blocks_from_tree_item(self, item):
         block = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
@@ -4034,7 +4192,1077 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.roi_btn_cancel.setEnabled(False)
         self.roi_progress_label.setText(f"错误: {error_msg}")
         self._restore_vr_pixels()
-        QtWidgets.QMessageBox.critical(self, "ROI检测失败", error_msg)
+        self.last_error = error_msg
+        self._mcp_push("roi_error", {"error": error_msg})
+        if not self._mcp_mode:
+            QtWidgets.QMessageBox.critical(self, "ROI检测失败", error_msg)
+
+    def closeEvent(self, event) -> None:
+        try:
+            if self.sam_session is not None:
+                self.sam_session.close()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    # ==================================================================
+    # 3D SAM 交互分割 (MPR 点击 → SAM-Med3D → 绿色高亮)
+    # ==================================================================
+
+    def _build_sam_tab(self) -> None:
+        """构建「3D SAM」页：模型控件 + 3 个 MPR 切片视图 + 点/结果控件。"""
+        sam_page = QtWidgets.QWidget()
+        sam_layout = QtWidgets.QVBoxLayout(sam_page)
+        sam_layout.setContentsMargins(4, 2, 4, 2)
+        sam_layout.setSpacing(6)
+
+        # --- 模型 ---
+        mdl_group = QtWidgets.QGroupBox("SAM-Med3D 模型 (3D 交互分割)")
+        mdl_layout = QtWidgets.QHBoxLayout(mdl_group)
+        self.sam_btn_load = QtWidgets.QPushButton("加载模型")
+        self.sam_btn_load.clicked.connect(self._sam_load_model)
+        self.sam_model_status = QtWidgets.QLabel("未加载")
+        self.sam_model_status.setWordWrap(True)
+        mdl_layout.addWidget(self.sam_btn_load)
+        mdl_layout.addWidget(self.sam_model_status, 1)
+        sam_layout.addWidget(mdl_group)
+
+        # --- MPR 视图 (2×2 布局: 轴向|冠状 / 矢状|信息) ---
+        self.sam_view_labels = {}   # axis -> QLabel
+        self.sam_view_sliders = {}  # axis -> QSlider
+        self.sam_view_names = {0: "轴向 (z)", 1: "冠状 (y)", 2: "矢状 (x)"}
+        mpr_group = QtWidgets.QGroupBox("MPR 切片 2×2（点击=加提示点；右击=加负点）")
+        mpr_grid = QtWidgets.QGridLayout(mpr_group)
+        mpr_grid.setSpacing(6)
+        # 记录每轴标签当前几何/像素自然尺寸（点击换算用）
+        self.sam_view_nat = {0: (1, 1), 1: (1, 1), 2: (1, 1)}
+        self.sam_view_idxlabels = {0: None, 1: None, 2: None}
+        _cell_pos = {0: (0, 0), 1: (0, 1), 2: (1, 0)}   # 轴向左上 冠状右上 矢状左下
+        for axis in (0, 1, 2):
+            cell = QtWidgets.QWidget()
+            col = QtWidgets.QVBoxLayout(cell)
+            col.setContentsMargins(0, 0, 0, 0)
+            hdr = QtWidgets.QHBoxLayout()
+            name_lb = QtWidgets.QLabel(self.sam_view_names[axis])
+            name_lb.setStyleSheet("font-weight: bold; color: #88b0c8;")
+            idx_lb = QtWidgets.QLabel("")
+            idx_lb.setStyleSheet("color: #b0b8c4;")
+            hdr.addWidget(name_lb)
+            hdr.addStretch()
+            hdr.addWidget(idx_lb)
+            col.addLayout(hdr)
+            img_lb = SamSliceLabel(axis)
+            img_lb.setMinimumSize(160, 150)
+            img_lb.setStyleSheet("background-color: #101018; border: 1px solid #30303e;")
+            col.addWidget(img_lb, 1)
+            sld = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            sld.setRange(0, 0)
+            sld.valueChanged.connect(lambda v, a=axis, il=idx_lb: self._sam_slider_changed(a, v, il))
+            col.addWidget(sld)
+            r, c = _cell_pos[axis]
+            mpr_grid.addWidget(cell, r, c)
+            self.sam_view_labels[axis] = img_lb
+            self.sam_view_sliders[axis] = sld
+            self.sam_view_idxlabels[axis] = idx_lb
+        # 第 4 格：信息/图例占位
+        info_cell = QtWidgets.QWidget()
+        info_col = QtWidgets.QVBoxLayout(info_cell)
+        leg = QtWidgets.QLabel(
+            "交互提示\n"
+            "· 左键 = 加正点(绿+)\n· 右击 = 加负点(红−)\n"
+            "· 点图后其余两平面自动定位\n\n"
+            "十字线图例\n"
+            "· 青 = 轴向面(z)\n· 橙 = 冠状面(y)\n· 品红 = 矢状面(x)\n\n"
+            "3D VR 在右侧窗口，分割结果以绿色高亮显示。"
+        )
+        leg.setWordWrap(True)
+        leg.setStyleSheet("color: #b0b8c4; background:#14141c; border:1px solid #30303e; padding:6px;")
+        info_col.addWidget(leg)
+        info_col.addStretch()
+        mpr_grid.addWidget(info_cell, 1, 1)
+        mpr_grid.setColumnStretch(0, 1)
+        mpr_grid.setColumnStretch(1, 1)
+        mpr_grid.setRowStretch(0, 1)
+        mpr_grid.setRowStretch(1, 1)
+        sam_layout.addWidget(mpr_group)
+
+        # --- 点/结果操作 ---
+        pts_group = QtWidgets.QGroupBox("提示点与分割")
+        pts_layout = QtWidgets.QVBoxLayout(pts_group)
+        mode_row = QtWidgets.QHBoxLayout()
+        self.sam_btn_mode_pos = QtWidgets.QRadioButton("正点 +")
+        self.sam_btn_mode_pos.setChecked(True)
+        self.sam_btn_mode_neg = QtWidgets.QRadioButton("负点 -")
+        mode_row.addWidget(self.sam_btn_mode_pos)
+        mode_row.addWidget(self.sam_btn_mode_neg)
+        mode_row.addStretch()
+        pts_layout.addLayout(mode_row)
+        self.sam_summary = QtWidgets.QLabel("无点")
+        pts_layout.addWidget(self.sam_summary)
+        op_row = QtWidgets.QHBoxLayout()
+        self.sam_btn_run = QtWidgets.QPushButton("分割 ▶")
+        self.sam_btn_run.setEnabled(False)
+        self.sam_btn_run.clicked.connect(self._sam_run)
+        self.sam_btn_undo = QtWidgets.QPushButton("撤销点")
+        self.sam_btn_undo.clicked.connect(self._sam_undo)
+        self.sam_btn_clearpts = QtWidgets.QPushButton("清空点")
+        self.sam_btn_clearpts.clicked.connect(self._sam_clear_points)
+        self.sam_btn_clearmask = QtWidgets.QPushButton("清结果")
+        self.sam_btn_clearmask.clicked.connect(self._sam_clear_result)
+        op_row.addWidget(self.sam_btn_run)
+        op_row.addWidget(self.sam_btn_undo)
+        op_row.addWidget(self.sam_btn_clearpts)
+        op_row.addWidget(self.sam_btn_clearmask)
+        pts_layout.addLayout(op_row)
+        save_row = QtWidgets.QHBoxLayout()
+        self.sam_btn_save = QtWidgets.QPushButton("保存 ROI")
+        self.sam_btn_save.setEnabled(False)
+        self.sam_btn_save.clicked.connect(self._sam_save_roi)
+        save_row.addWidget(self.sam_btn_save)
+        self.sam_save_status = QtWidgets.QLabel("")
+        self.sam_save_status.setStyleSheet("color:#88c8a8; font-size:11px;")
+        save_row.addWidget(self.sam_save_status, 1)
+        pts_layout.addLayout(save_row)
+        thr_row = QtWidgets.QHBoxLayout()
+        thr_row.addWidget(QtWidgets.QLabel("阈值"))
+        self.sam_threshold_spin = QtWidgets.QDoubleSpinBox()
+        self.sam_threshold_spin.setRange(0.05, 0.95)
+        self.sam_threshold_spin.setSingleStep(0.05)
+        self.sam_threshold_spin.setValue(0.30)
+        thr_row.addWidget(self.sam_threshold_spin)
+        thr_row.addStretch()
+        pts_layout.addLayout(thr_row)
+        self.sam_progress_lb = QtWidgets.QLabel("")
+        self.sam_progress_lb.setWordWrap(True)
+        self.sam_progress_lb.setStyleSheet("color: #88b0c8; font-size: 11px;")
+        pts_layout.addWidget(self.sam_progress_lb)
+        sam_layout.addWidget(pts_group)
+
+        # --- 已保存 ROI 列表/加载 ---
+        self._build_saved_roi_panel(sam_layout)
+        sam_layout.addStretch()
+
+        # 点击事件（左键=当前模式点，右键=负点）
+        for axis, lb in self.sam_view_labels.items():
+            lb.clicked.connect(self._sam_label_mouse)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(sam_page)
+        self.pages.addTab(scroll, "3D SAM")
+
+    # ---------------- 会话/模型 ----------------
+    def _sam_ensure_worker(self):
+        """惰性创建常驻后台线程与 worker。
+
+        注意：必须在主线程先初始化 torch/CUDA 上下文，否则后台线程第 2 次
+        CUDA 调用会死锁（GUI 表现为第二次点击分割卡死）。
+        基础版 EXE（未打包 torch/medim）会在此给出友好提示。
+        """
+        try:
+            from segmentation.sam_pipeline import SamSession, ensure_torch_cuda_on_main
+        except Exception as e:  # noqa: BLE001
+            self._sam_status(f"3D SAM 依赖未打包：{type(e).__name__}: {e}\n请用 mar 环境运行源码，或使用 build_full 完整版", "#e07070")
+            return None
+        ensure_torch_cuda_on_main()   # 主线程预建 CUDA 上下文（幂等、轻量）
+        if self.sam_session is not None and self.sam_session.worker is not None:
+            return self.sam_session.worker
+        self.sam_session = SamSession(self)
+        worker = self.sam_session.start()
+        worker.progress_signal.connect(self._sam_on_progress)
+        worker.finished_signal.connect(self._sam_on_finished)
+        worker.error_signal.connect(self._sam_on_error)
+        return worker
+
+    def _sam_load_model(self):
+        """启动常驻后台线程；SAM 权重在首次分割时自动加载（可点此预热）。"""
+        worker = self._sam_ensure_worker()
+        if worker is None:
+            return
+        self._sam_status("后台线程就绪；首次分割将自动加载权重 (~383MB)", "#e0c060")
+        try:
+            QtCore.QMetaObject.invokeMethod(
+                worker, "ensure", QtCore.Qt.ConnectionType.QueuedConnection,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _sam_status(self, text, color="#b0b8c4"):
+        self.sam_model_status.setText(text)
+        self.sam_model_status.setStyleSheet(f"color: {color};")
+
+    # ---------------- 视图 ----------------
+    def _sam_vol(self):
+        vol = getattr(self, "vr_work_array", None)
+        if vol is None:
+            vol = getattr(self, "vr_base_array", None)
+        return vol
+
+    def _sam_shape(self):
+        vol = self._sam_vol()
+        if vol is None:
+            return None
+        return tuple(int(v) for v in vol.shape)  # (D,H,W)
+
+    def _sam_slider_changed(self, axis, value, idx_lb):
+        # 任一切片变化都会影响三视图十字线 → 整体刷新
+        if hasattr(self, "sam_view_sliders") and not self._sam_refreshing:
+            self._sam_refresh_views()
+        else:
+            if idx_lb is not None:
+                idx_lb.setText(f"{self.sam_view_names[axis]} = {value}")
+
+    def _sam_cur_idx(self, axis):
+        try:
+            return int(self.sam_view_sliders[axis].value())
+        except Exception:
+            return 0
+
+    def _sam_axis_slice(self, vol, axis, idx):
+        """返回 (显示用 2D 数组, 行数, 列数)。
+
+        轴 0=轴向(z 固定, 行=y 列=x)；轴 1=冠状(y 固定, 行=z 列=x)；
+        轴 2=矢状(x 固定, 行=z 列=y)。
+        冠状/矢状行序按「顶部=最大 z(头/上)」翻转，与 VR 冠状/矢状视角一致。
+        """
+        D = vol.shape[0]
+        if axis == 0:
+            return vol[idx, :, :], vol.shape[1], vol.shape[2]
+        if axis == 1:
+            return vol[::-1, idx, :], D, vol.shape[2]   # 行=z 翻转
+        return vol[::-1, :, idx], D, vol.shape[1]       # 行=z 翻转
+
+    def _sam_voxel(self, axis, idx, row, col, D):
+        if axis == 0:
+            return int(idx), int(row), int(col)
+        if axis == 1:
+            return int(D - 1 - row), int(idx), int(col)
+        return int(D - 1 - row), int(col), int(idx)
+
+    def _sam_view_pos(self, axis, D, z, y, x):
+        """体素 (z,y,x) → 该视图像素 (col,row)。"""
+        if axis == 0:
+            return x, y
+        if axis == 1:
+            return x, D - 1 - z
+        return y, D - 1 - z
+
+    @staticmethod
+    def _sam_plane_pos(axis, plane_axis, idx, D, H, W):
+        """某平面(plane_axis, 索引=idx)在当前视图(axis)上的线位置。
+
+        返回 (col,row,vertical)：vertical=True 为竖线(固定col, 沿行延展)，
+        False 为横线(固定row, 沿列延展)。
+        """
+        if axis == 0:            # 轴向: 行=y(idx 即 plane1), 列=x
+            if plane_axis == 1:      # 冠状面(y=idx) → 横线 row=idx
+                return 0, idx, False
+            if plane_axis == 2:      # 矢状面(x=idx) → 竖线 col=idx
+                return idx, 0, True
+        elif axis == 1:          # 冠状: 行=z(翻转为 D-1-idx), 列=x
+            if plane_axis == 0:      # 轴向(z=idx) → 横线 row=D-1-idx
+                return 0, D - 1 - idx, False
+            if plane_axis == 2:      # 矢状面(x=idx) → 竖线 col=idx
+                return idx, 0, True
+        elif axis == 2:          # 矢状: 行=z(翻转), 列=y
+            if plane_axis == 0:      # 轴向(z=idx) → 横线 row=D-1-idx
+                return 0, D - 1 - idx, False
+            if plane_axis == 1:      # 冠状面(y=idx) → 竖线 col=idx
+                return idx, 0, True
+        return None, None, None
+
+    # 平面颜色：青=轴向面(z)、橙=冠状面(y)、品红=矢状面(x)
+    _SAM_PLANE_COLORS = {0: (0, 224, 255), 1: (255, 176, 0), 2: (255, 64, 224)}
+
+    def _sam_draw_crosshair(self, pix, axis, D, H, W):
+        """在已生成的基础图上叠加互动十字线（其余两平面的位置）。"""
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rows, cols = pix.height(), pix.width()
+        for plane_axis in (0, 1, 2):
+            if plane_axis == axis:
+                continue
+            idx = self._sam_cur_idx(plane_axis)
+            col, row, vertical = self._sam_plane_pos(axis, plane_axis, idx, D, H, W)
+            if col is None:
+                continue
+            cr, cg, cb = self._SAM_PLANE_COLORS[plane_axis]
+            pen = QPen(QColor(cr, cg, cb, 190))
+            pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            if vertical:
+                p.drawLine(int(col), 0, int(col), rows - 1)
+            else:
+                p.drawLine(0, int(row), cols - 1, int(row))
+        p.end()
+
+    def _sam_render_view(self, axis):
+        vol = self._sam_vol()
+        if vol is None:
+            self.sam_view_labels[axis].setPixmap(QPixmap())
+            return
+        D, H, W = vol.shape
+        idx = int(max(0, min(self._sam_cur_idx(axis), [D, H, W][axis] - 1)))
+        arr, rows, cols = self._sam_axis_slice(vol, axis, idx)
+        wl_offset = self.wl_slider.slider().value()
+        ww_scale = self.ww_slider.slider().value() / 100.0
+        adj = arr.astype(np.float32) * ww_scale + wl_offset
+        gray = np.clip((adj - (-1024.0)) / 4096.0 * 255.0, 0, 255).astype(np.uint8)
+        rgb = np.repeat(gray[:, :, None], 3, axis=2)
+
+        mask = self.sam_mask
+        if mask is not None and mask.shape == (D, H, W):
+            m = mask[idx, :, :] if axis == 0 else (mask[:, idx, :] if axis == 1 else mask[:, :, idx])
+            if axis in (1, 2):
+                m = m[::-1, :]          # 与行翻转后的视图对齐
+            if m.shape == rgb.shape[:2]:
+                over = rgb[m]
+                rgb[m] = (0.20 * over + 0.80 * np.array([90, 255, 110], dtype=np.float32)).astype(np.uint8)
+
+        self.sam_view_nat[axis] = (rows, cols)
+        pix = self._np_rgb_to_pixmap(rgb)
+        # 互动十字线
+        self._sam_draw_crosshair(pix, axis, D, H, W)
+        # 提示点标记（仅在点所在平面显示；行映射需考虑 z 翻转）
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(0, 255, 0), 2))
+        for pt in self.sam_pos_pts:
+            z, y, x = pt
+            if (axis == 0 and z == idx) or (axis == 1 and y == idx) or (axis == 2 and x == idx):
+                col, row = self._sam_view_pos(axis, D, z, y, x)
+                self._paint_cross(p, col, row)
+        p.setPen(QPen(QColor(255, 40, 40), 2))
+        for pt in self.sam_neg_pts:
+            z, y, x = pt
+            if (axis == 0 and z == idx) or (axis == 1 and y == idx) or (axis == 2 and x == idx):
+                col, row = self._sam_view_pos(axis, D, z, y, x)
+                self._paint_cross(p, col, row)
+        p.end()
+        self.sam_view_labels[axis].set_source(pix)
+        ilb = self.sam_view_idxlabels.get(axis)
+        if ilb is not None:
+            ilb.setText(f"{self.sam_view_names[axis]} = {idx}")
+
+    @staticmethod
+    def _paint_cross(p: QPainter, cx, cy):
+        r = 6
+        p.drawLine(int(cx) - r, int(cy), int(cx) + r, int(cy))
+        p.drawLine(int(cx), int(cy) - r, int(cx), int(cy) + r)
+
+    @staticmethod
+    def _np_rgb_to_pixmap(rgb):
+        rows, cols, _ = rgb.shape
+        img = QImage(rgb.data, cols, rows, 3 * cols, QImage.Format.Format_RGB888).copy()
+        return QPixmap.fromImage(img)
+
+    def _sam_refresh_views(self):
+        if self._sam_refreshing:
+            return
+        self._sam_refreshing = True
+        try:
+            if self._sam_vol() is None:
+                for a in (0, 1, 2):
+                    self.sam_view_labels[a].setText("无数据")
+                    self.sam_view_sliders[a].setRange(0, 0)
+                return
+            D, H, W = self._sam_shape()
+            for a, dim in ((0, D), (1, H), (2, W)):
+                sld = self.sam_view_sliders[a]
+                old = sld.value()
+                sld.blockSignals(True)
+                sld.setRange(0, max(0, dim - 1))
+                if old == 0 and dim > 0:
+                    sld.setValue(dim // 2)
+                sld.blockSignals(False)
+            for a in (0, 1, 2):
+                self._sam_render_view(a)
+        finally:
+            self._sam_refreshing = False
+
+    def _sam_reset(self):
+        """新数据加载后重置 SAM 状态。"""
+        self.sam_pos_pts = []
+        self.sam_neg_pts = []
+        self.sam_mask = None
+        self.sam_busy = False
+        self.sam_pending = False
+        if hasattr(self, "sam_summary"):
+            self.sam_summary.setText("无点")
+            self.sam_progress_lb.setText("")
+            self.sam_btn_run.setEnabled(False)
+        if hasattr(self, "sam_view_sliders"):
+            self._sam_refresh_views()
+
+    # ---------------- 点击 ----------------
+    def _sam_label_mouse(self, axis, ev):
+        vol = self._sam_vol()
+        if vol is None:
+            return
+        D, H, W = vol.shape
+        sld = self.sam_view_sliders[axis]
+        idx = sld.value()
+        rows, cols = self.sam_view_nat[axis]
+        lb = self.sam_view_labels[axis]
+        # 用实际等比绘制矩形换算坐标（点在图外则忽略）
+        disp = lb.display_rect()
+        px, py = ev.position().x(), ev.position().y()
+        if disp.isNull() or disp.width() < 2 or disp.height() < 2:
+            return
+        if not disp.contains(int(px), int(py)):
+            return
+        col = int(min(cols - 1, max(0, (px - disp.x()) / disp.width() * cols)))
+        row = int(min(rows - 1, max(0, (py - disp.y()) / disp.height() * rows)))
+        vox = self._sam_voxel(axis, idx, row, col, D)
+        positive = self.sam_btn_mode_pos.isChecked()
+        if ev.button() == QtCore.Qt.MouseButton.RightButton:
+            positive = False
+        # 互动：把另外两平面切到点击体素处（三视图十字线交汇于该点）
+        z, y, x = vox
+        if axis != 0:
+            s0 = self.sam_view_sliders[0]
+            s0.setValue(int(max(0, min(z, D - 1))))
+        if axis != 1:
+            s1 = self.sam_view_sliders[1]
+            s1.setValue(int(max(0, min(y, H - 1))))
+        if axis != 2:
+            s2 = self.sam_view_sliders[2]
+            s2.setValue(int(max(0, min(x, W - 1))))
+        self._sam_add_point(vox, positive)
+
+    def _sam_add_point(self, vox, positive):
+        if self.sam_busy:
+            return
+        if positive:
+            self.sam_pos_pts.append(tuple(int(v) for v in vox))
+        else:
+            self.sam_neg_pts.append(tuple(int(v) for v in vox))
+        self._sam_refresh_views()
+        self.sam_summary.setText(
+            f"正 {len(self.sam_pos_pts)} 负 {len(self.sam_neg_pts)}  最近点 (z={vox[0]},y={vox[1]},x={vox[2]})"
+        )
+        self.sam_btn_run.setEnabled(True)
+        self._sam_run()
+
+    def _sam_undo(self):
+        if self.sam_pos_pts:
+            self.sam_pos_pts.pop()
+        elif self.sam_neg_pts:
+            self.sam_neg_pts.pop()
+        self._sam_refresh_views()
+        self.sam_summary.setText(f"正 {len(self.sam_pos_pts)} 负 {len(self.sam_neg_pts)}")
+        if self.sam_pos_pts or self.sam_neg_pts:
+            self.sam_btn_run.setEnabled(True)
+            self._sam_run()
+        else:
+            self.sam_btn_run.setEnabled(False)
+            self.sam_mask = None
+            self._sam_clear_overlay()
+
+    def _sam_clear_points(self):
+        self.sam_pos_pts = []
+        self.sam_neg_pts = []
+        self.sam_summary.setText("无点")
+        self.sam_btn_run.setEnabled(False)
+        self.sam_mask = None
+        self._sam_clear_overlay()
+        self._sam_refresh_views()
+
+    def _sam_clear_result(self):
+        self.sam_mask = None
+        self._sam_clear_overlay()
+        self._sam_refresh_views()
+        if hasattr(self, "sam_btn_save"):
+            self.sam_btn_save.setEnabled(False)
+
+    # ---------------- ROI 保存 ----------------
+    def _sam_roi_stats(self):
+        """从当前 SAM mask + VR 网格计算统计，供保存对话框预填。"""
+        mask = self.sam_mask
+        vol = self._sam_vol()
+        if mask is None or vol is None or mask.shape != vol.shape or not mask.any():
+            return None
+        vals = vol[mask].astype(np.float64)
+        spacing = (1.0, 1.0, 1.0)
+        try:
+            if self.vr_image_data is not None:
+                spacing = tuple(float(v) for v in self.vr_image_data.GetSpacing())
+        except Exception:
+            pass
+        vol_mm3 = vals.size * spacing[0] * spacing[1] * spacing[2]
+        return {
+            "voxels": int(vals.size),
+            "volume_cm3": vol_mm3 / 1000.0,
+            "mean_hu": float(vals.mean()),
+            "std_hu": float(vals.std()),
+            "min_hu": float(vals.min()),
+            "max_hu": float(vals.max()),
+        }
+
+    def _sam_save_roi(self):
+        """弹窗输入 ROI 名称/体积/统计值并保存记录。"""
+        stats = self._sam_roi_stats()
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("保存 ROI（3D SAM）")
+        dlg.setMinimumWidth(420)
+        form = QtWidgets.QFormLayout(dlg)
+        ed_name = QtWidgets.QLineEdit("")
+        ed_name.setPlaceholderText("例如：左上肺叶 / 病灶A")
+        form.addRow("ROI 名称 *", ed_name)
+        sp_vol = QtWidgets.QDoubleSpinBox()
+        sp_vol.setRange(0.0, 1e7); sp_vol.setDecimals(3); sp_vol.setSuffix(" cm³")
+        sp_vox = QtWidgets.QSpinBox(); sp_vox.setRange(0, 10 ** 9)
+        sp_mean = QtWidgets.QDoubleSpinBox(); sp_mean.setRange(-4000, 8000); sp_mean.setDecimals(2); sp_mean.setSuffix(" HU")
+        sp_std = QtWidgets.QDoubleSpinBox(); sp_std.setRange(0, 8000); sp_std.setDecimals(2)
+        sp_min = QtWidgets.QDoubleSpinBox(); sp_min.setRange(-4000, 8000); sp_min.setDecimals(2)
+        sp_max = QtWidgets.QDoubleSpinBox(); sp_max.setRange(-4000, 8000); sp_max.setDecimals(2)
+        if stats:
+            sp_vol.setValue(round(stats["volume_cm3"], 3))
+            sp_vox.setValue(stats["voxels"])
+            sp_mean.setValue(round(stats["mean_hu"], 2))
+            sp_std.setValue(round(stats["std_hu"], 2))
+            sp_min.setValue(round(stats["min_hu"], 2))
+            sp_max.setValue(round(stats["max_hu"], 2))
+            auto = QtWidgets.QLabel("已从当前绿色 SAM 结果自动计算，可修改。")
+        else:
+            auto = QtWidgets.QLabel("当前无 SAM 结果：请手动填写体积与统计值。")
+        auto.setStyleSheet("color:#88b0c8;")
+        form.addRow(auto)
+        form.addRow("体积", sp_vol)
+        form.addRow("体素数", sp_vox)
+        form.addRow("像素均值", sp_mean)
+        form.addRow("标准差", sp_std)
+        form.addRow("最小值", sp_min)
+        form.addRow("最大值", sp_max)
+        ed_src = QtWidgets.QLineEdit(os.path.basename(self.path_edit.line_edit().text().strip()) or "3D SAM")
+        form.addRow("来源/病例", ed_src)
+        ed_note = QtWidgets.QLineEdit("")
+        ed_note.setPlaceholderText("备注（可选）")
+        form.addRow("备注", ed_note)
+        hint = QtWidgets.QLabel("")
+        hint.setStyleSheet("color:#e07070;")
+        form.addRow(hint)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QtWidgets.QDialogButtonBox.StandardButton.Save).setText("保存")
+        bb.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        form.addRow(bb)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+
+        while True:
+            if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return
+            name = ed_name.text().strip()
+            if name:
+                break
+            hint.setText("请填写 ROI 名称")
+        import csv, time
+        from mcp_ssd_vr import config as _cfg
+        _cfg.ensure_dirs()
+        # 先落盘 mask (npy)，再写 CSV（含 mask_npy 路径列，供列表加载回显）
+        npy_path = ""
+        if stats is not None:
+            npy_dir = os.path.join(_cfg.record_dir(), "roi_sam_masks")
+            os.makedirs(npy_dir, exist_ok=True)
+            npy_path = os.path.join(npy_dir, f"sam_{time.strftime('%Y%m%d_%H%M%S')}_{name}.npy")
+            np.save(npy_path, self.sam_mask)
+        rec = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "name": name,
+            "volume_cm3": sp_vol.value(),
+            "voxels": sp_vox.value(),
+            "mean_hu": sp_mean.value(),
+            "std_hu": sp_std.value(),
+            "min_hu": sp_min.value(),
+            "max_hu": sp_max.value(),
+            "source": ed_src.text().strip() or "3D SAM",
+            "note": ed_note.text().strip(),
+            "pos_points": len(self.sam_pos_pts),
+            "neg_points": len(self.sam_neg_pts),
+            "mask_npy": npy_path,
+        }
+        csv_path = self._sam_roi_csv_path()
+        header = ["time", "name", "volume_cm3", "voxels", "mean_hu", "std_hu",
+                  "min_hu", "max_hu", "source", "note", "pos_points", "neg_points", "mask_npy"]
+        new_file = not os.path.exists(csv_path)
+        try:
+            with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+                if new_file:
+                    w.writeheader()
+                w.writerow(rec)
+            msg = f"已保存 ROI: {name}（体积 {sp_vol.value():.3f} cm³） → {csv_path}"
+            if npy_path:
+                msg += f"\nmask: {npy_path}"
+            self.sam_save_status.setText(msg)
+            self._sam_status(f"ROI 已保存: {name}", "#88c8a8")
+            self._sam_refresh_roi_list()
+        except Exception as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(self, "保存失败", str(e))
+
+    @staticmethod
+    def _sam_roi_csv_path():
+        from mcp_ssd_vr import config as _cfg
+        _cfg.ensure_dirs()
+        return os.path.join(_cfg.record_dir(), "roi_summary_3dsam.csv")
+
+    def _sam_roi_load_records(self):
+        """读取已保存 ROI 记录；旧文件无 mask_npy 列时自动补空列迁移。"""
+        import csv as _csv
+        path = self._sam_roi_csv_path()
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", newline="", encoding="utf-8-sig") as f:
+            rows = list(_csv.DictReader(f))
+        full_header = ["time", "name", "volume_cm3", "voxels", "mean_hu", "std_hu",
+                       "min_hu", "max_hu", "source", "note", "pos_points", "neg_points", "mask_npy"]
+        if not rows:
+            return rows
+        if "mask_npy" not in rows[0]:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = _csv.DictWriter(f, fieldnames=full_header, extrasaction="ignore")
+                w.writeheader()
+                for r in rows:
+                    r.setdefault("mask_npy", "")
+                    w.writerow(r)
+            for r in rows:
+                r.setdefault("mask_npy", "")
+        return rows
+
+    def _build_saved_roi_panel(self, sam_layout) -> None:
+        """「已保存 ROI」列表 + 加载/删除。"""
+        grp = QtWidgets.QGroupBox("已保存 ROI（列表/加载）")
+        lay = QtWidgets.QVBoxLayout(grp)
+        self.sam_roi_table = QtWidgets.QTableWidget(0, 6)
+        self.sam_roi_table.setHorizontalHeaderLabels(
+            ["时间", "名称", "体积 cm³", "均值 HU", "来源", "mask"])
+        self.sam_roi_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.sam_roi_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        # 选中行高亮样式（深色主题下也要明显）
+        self.sam_roi_table.setStyleSheet(
+            "QTableWidget::item:selected { background:#2f7fd0; color:#ffffff; }"
+            "QTableWidget::item:selected:!active { background:#26527f; color:#e8f0ff; }"
+            "QTableWidget::item:hover { background:#1d3b5a; }"
+            "QTableWidget { selection-background-color:#2f7fd0; }")
+        self.sam_roi_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.sam_roi_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.sam_roi_table.verticalHeader().setVisible(False)
+        self.sam_roi_table.setMaximumHeight(160)
+        lay.addWidget(self.sam_roi_table)
+        btns = QtWidgets.QHBoxLayout()
+        self.sam_btn_reload_roi = QtWidgets.QPushButton("刷新列表")
+        self.sam_btn_reload_roi.clicked.connect(self._sam_refresh_roi_list)
+        self.sam_btn_load_roi = QtWidgets.QPushButton("加载选中 → 高亮")
+        self.sam_btn_load_roi.clicked.connect(self._sam_load_selected_roi)
+        self.sam_btn_del_roi = QtWidgets.QPushButton("删除选中")
+        self.sam_btn_del_roi.clicked.connect(self._sam_delete_selected_roi)
+        self.sam_btn_export_xlsx = QtWidgets.QPushButton("一键导出 Excel")
+        self.sam_btn_export_xlsx.clicked.connect(self._sam_export_roi_excel)
+        btns.addWidget(self.sam_btn_reload_roi)
+        btns.addWidget(self.sam_btn_load_roi)
+        btns.addWidget(self.sam_btn_del_roi)
+        btns.addWidget(self.sam_btn_export_xlsx)
+        lay.addLayout(btns)
+        # 第二行：全选 / 选中即高亮(叠加)
+        row2 = QtWidgets.QHBoxLayout()
+        self.sam_btn_sel_all = QtWidgets.QPushButton("全选")
+        self.sam_btn_sel_all.clicked.connect(self._sam_roi_select_all)
+        self.sam_chk_auto_hl = QtWidgets.QCheckBox("选中行同步到 VR 绿色高亮（叠加）")
+        self.sam_chk_auto_hl.setChecked(False)
+        self.sam_chk_auto_hl.toggled.connect(self._sam_roi_selection_changed)
+        row2.addWidget(self.sam_btn_sel_all)
+        row2.addWidget(self.sam_chk_auto_hl)
+        row2.addStretch()
+        lay.addLayout(row2)
+        # 行选择变化 → 若开启自动高亮则重算叠加
+        self.sam_roi_table.itemSelectionChanged.connect(self._sam_roi_selection_changed)
+        self.sam_roi_panel_status = QtWidgets.QLabel("")
+        self.sam_roi_panel_status.setWordWrap(True)
+        self.sam_roi_panel_status.setStyleSheet("color:#88b0c8; font-size:11px;")
+        lay.addWidget(self.sam_roi_panel_status)
+        sam_layout.addWidget(grp)
+        self._sam_refresh_roi_list()
+
+    def _sam_refresh_roi_list(self):
+        if not hasattr(self, "sam_roi_table"):
+            return
+        rows = self._sam_roi_load_records()
+        tbl = self.sam_roi_table
+        tbl.setRowCount(0)
+        self._sam_roi_cache = rows
+        for i, r in enumerate(rows):
+            tbl.insertRow(i)
+            mask_ok = bool(r.get("mask_npy")) and os.path.exists(r.get("mask_npy") or "")
+            vals = [r.get("time", ""), r.get("name", ""), r.get("volume_cm3", ""),
+                    r.get("mean_hu", ""), r.get("source", ""), "✓" if mask_ok else "—"]
+            for c, v in enumerate(vals):
+                item = QtWidgets.QTableWidgetItem(str(v))
+                if c == 5:
+                    item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                tbl.setItem(i, c, item)
+        path = self._sam_roi_csv_path()
+        self.sam_roi_panel_status.setText(
+            f"共 {len(rows)} 条 ｜ {path}" + ("（无 mask 的记录仅能查看统计，无法高亮）" if any(
+                not (r.get("mask_npy") and os.path.exists(r.get("mask_npy") or "")) for r in rows) else ""))
+
+    def _sam_sync_roi_blocks(self, region_results) -> int:
+        """自动 ROI(TotalSegmentator/SynthSeg) 完成后：把各解剖结构统计自动同步进已保存 ROI 列表。
+
+        轻量同步：只记录 名称/体积/体素数/来源 等统计（不带大 mask，可日后手动补存高亮项）。
+        返回本次新增条数。同 (名称+来源+体积) 去重，避免重复分割反复追加。
+        """
+        import csv as _csv
+        import time as _time
+        try:
+            existing = self._sam_roi_load_records()
+            seen = {(r.get("source", ""), r.get("name", ""), str(round(float(r.get("volume_cm3") or 0), 3)))
+                    for r in existing}
+            header = ["time", "name", "volume_cm3", "voxels", "mean_hu", "std_hu",
+                      "min_hu", "max_hu", "source", "note", "pos_points", "neg_points", "mask_npy"]
+            source = "TotalSegmentator:" + str(getattr(self, "roi_current_task", "total"))
+            now = _time.strftime("%Y-%m-%d %H:%M:%S")
+            new_rows = []
+            for res in (region_results or []):
+                for cat in ("bones", "vessels", "tissues"):
+                    for b in getattr(res, cat, []) or []:
+                        name = (b.anatomical_name or b.category or "结构")
+                        key = (source, name, str(round(float(getattr(b, "volume_cm3", 0) or 0), 3)))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        new_rows.append({
+                            "time": now,
+                            "name": name,
+                            "volume_cm3": round(float(getattr(b, "volume_cm3", 0) or 0), 3),
+                            "voxels": int(getattr(b, "voxel_count", 0) or 0),
+                            "mean_hu": "",
+                            "std_hu": "",
+                            "min_hu": "",
+                            "max_hu": "",
+                            "source": source,
+                            "note": f"{b.category}｜区域 {getattr(b,'region','')}｜label {getattr(b,'label_id','')}",
+                            "pos_points": 0,
+                            "neg_points": 0,
+                            "mask_npy": "",
+                        })
+            if not new_rows:
+                return 0
+            path = self._sam_roi_csv_path()
+            new_file = not os.path.exists(path)
+            with open(path, "a", newline="", encoding="utf-8-sig") as f:
+                w = _csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+                if new_file:
+                    w.writeheader()
+                for r in new_rows:
+                    w.writerow(r)
+            if hasattr(self, "sam_roi_table"):
+                self._sam_refresh_roi_list()
+                self.sam_save_status.setText(f"自动同步 {len(new_rows)} 个解剖结构到已保存ROI（TotalSegmentator 完成）")
+            return len(new_rows)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    # ---- 已保存ROI 列表：多选/全选/选中高亮 ----
+    def _sam_roi_selected_rows(self):
+        """返回当前选中行的记录列表（按行序）。"""
+        cache = getattr(self, "_sam_roi_cache", [])
+        sel = sorted({i.row() for i in self.sam_roi_table.selectionModel().selectedRows()})
+        return [cache[i] for i in sel if 0 <= i < len(cache)]
+
+    def _sam_roi_select_all(self):
+        self.sam_roi_table.selectAll()
+
+    def _sam_roi_selection_changed(self, *args):
+        if not getattr(self, "sam_chk_auto_hl", None) or not self.sam_chk_auto_hl.isChecked():
+            return
+        QtCore.QTimer.singleShot(30, self._sam_roi_apply_selection_highlight)
+
+    def _sam_roi_apply_selection_highlight(self, quiet=True):
+        """把当前选中行(带 mask)合并叠加为绿色高亮；无选中则清空。"""
+        rows = self._sam_roi_selected_rows()
+        if not rows:
+            self.sam_mask = None
+            self._sam_clear_overlay()
+            self._sam_refresh_views()
+            return
+        withmask = [r for r in rows if r.get("mask_npy") and os.path.exists(r.get("mask_npy") or "")]
+        if not withmask:
+            return
+        cur = self._sam_vol()
+        if cur is None:
+            return
+        shape = tuple(cur.shape)
+        acc = None
+        names = []
+        for r in withmask:
+            try:
+                m = np.load(r["mask_npy"])
+                if m.dtype != bool:
+                    m = m > 0.5
+                if m.shape != shape:
+                    m = self._resize_mask_nearest(m, shape)
+                acc = m if acc is None else (acc | m)
+                names.append(r.get("name", "?"))
+            except Exception:
+                continue
+        if acc is None:
+            return
+        self.sam_mask = acc
+        self._sam_write_overlay()
+        self._sam_refresh_views()
+        if not quiet:
+            self.sam_progress_lb.setText(f"叠加高亮 {len(withmask)} 条 ROI: {'、'.join(names[:6])}{'…' if len(names) > 6 else ''}（{int(acc.sum())} 体素）")
+        else:
+            self.sam_progress_lb.setText(f"已叠加高亮 {len(withmask)} 条 ROI（{int(acc.sum())} 体素）")
+        self._sam_status(f"高亮 {len(withmask)} 条", "#88c8a8")
+
+    def _sam_load_selected_roi(self):
+        cache = getattr(self, "_sam_roi_cache", [])
+        rows = self._sam_roi_selected_rows()
+        if not rows:
+            QtWidgets.QMessageBox.information(self, "提示", "请先在列表选中（可多选/全选）已保存 ROI")
+            return
+        no_mask = [r.get("name") for r in rows if not (r.get("mask_npy") and os.path.exists(r.get("mask_npy") or ""))]
+        cur = self._sam_vol()
+        shape = tuple(cur.shape) if cur is not None else None
+        acc = None
+        cnt = 0
+        for r in rows:
+            npy = r.get("mask_npy") or ""
+            if not os.path.exists(npy):
+                continue
+            try:
+                m = np.load(npy)
+                if m.dtype != bool:
+                    m = m > 0.5
+                if shape is not None and m.shape != shape:
+                    m = self._resize_mask_nearest(m, shape)
+                acc = m if acc is None else (acc | m)
+                cnt += 1
+            except Exception as e:  # noqa: BLE001
+                QtWidgets.QMessageBox.warning(self, "加载失败", f"{r.get('name')}: {e}")
+        if acc is None:
+            names = "、".join(r.get("name", "?") for r in rows[:8])
+            QtWidgets.QMessageBox.warning(self, "无 mask",
+                                          f"选中记录都没有可加载的 mask：\n{names}"
+                                          + ("…" if len(rows) > 8 else "")
+                                          + "\n（列表「—」行只有统计，无法高亮）")
+            return
+        self.sam_mask = acc
+        self._sam_write_overlay()
+        self._sam_refresh_views()
+        msg = f"已加载并叠加 {cnt} 条 ROI（{int(acc.sum())} 体素，绿色高亮）"
+        if no_mask:
+            msg += "\n无 mask 仅统计：" + "、".join(no_mask[:8]) + ("…" if len(no_mask) > 8 else "")
+        self.sam_progress_lb.setText(msg)
+        self._sam_status(f"已加载 {cnt} 条 ROI", "#88c8a8")
+
+    def _sam_delete_selected_roi(self):
+        rows = self._sam_roi_selected_rows()
+        if not rows:
+            QtWidgets.QMessageBox.information(self, "提示", "请先选中要删除的记录（可多选/全选）")
+            return
+        names = "、".join(r.get("name", "?") for r in rows[:6]) + ("…" if len(rows) > 6 else "")
+        if QtWidgets.QMessageBox.question(
+                self, "删除确认", f"删除选中的 {len(rows)} 条 ROI？\n{names}\n(关联的 npy mask 也会删除)",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No) != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        import csv as _csv
+        path = self._sam_roi_csv_path()
+        all_rows = self._sam_roi_load_records()
+        idxs = {self.sam_roi_table.row(i) for i in self.sam_roi_table.selectionModel().selectedRows()}
+        to_del = [r for i, r in enumerate(all_rows) if i in idxs]
+        keep = [r for i, r in enumerate(all_rows) if i not in idxs]
+        header = list(all_rows[0].keys()) if all_rows else \
+            ["time", "name", "volume_cm3", "voxels", "mean_hu", "std_hu",
+             "min_hu", "max_hu", "source", "note", "pos_points", "neg_points", "mask_npy"]
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = _csv.DictWriter(f, fieldnames=header)
+            w.writeheader()
+            for row in keep:
+                w.writerow(row)
+        removed_npy = 0
+        for r in to_del:
+            npy = r.get("mask_npy") or ""
+            if npy and os.path.exists(npy):
+                try:
+                    os.remove(npy)
+                    removed_npy += 1
+                except Exception:
+                    pass
+        self.sam_save_status.setText(f"已删除 {len(to_del)} 条 ROI（含 {removed_npy} 个 mask）")
+        self._sam_refresh_roi_list()
+        self._sam_roi_selection_changed()
+
+    def _sam_export_roi_excel(self):
+        """把已保存 ROI 全部记录一键导出为 Excel(.xlsx)。"""
+        import time as _t
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill, Alignment
+            from openpyxl.utils import get_column_letter
+        except Exception as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(self, "缺少依赖", f"需要 openpyxl：{e}")
+            return
+        rows = self._sam_roi_load_records()
+        if not rows:
+            QtWidgets.QMessageBox.information(self, "无数据", "当前没有已保存的 ROI 记录。")
+            return
+        headers = [
+            "保存时间", "ROI 名称", "体积 cm³", "体素数", "均值 HU", "标准差",
+            "最小 HU", "最大 HU", "来源", "备注", "正点数", "负点数", "mask 文件",
+        ]
+        keys = ["time", "name", "volume_cm3", "voxels", "mean_hu", "std_hu",
+                "min_hu", "max_hu", "source", "note", "pos_points", "neg_points", "mask_npy"]
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "ROI"
+        head_font = Font(bold=True, color="FFFFFF")
+        head_fill = PatternFill("solid", fgColor="4472C4")
+        for c, h in enumerate(headers, start=1):
+            cell = ws.cell(row=1, column=c, value=h)
+            cell.font = head_font
+            cell.fill = head_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        num_keys = {"volume_cm3", "voxels", "mean_hu", "std_hu", "min_hu", "max_hu",
+                    "pos_points", "neg_points"}
+
+        for i, r in enumerate(rows, start=2):
+            for c, k in enumerate(keys, start=1):
+                val = r.get(k, "")
+                if k in num_keys and isinstance(val, str) and val != "":
+                    try:
+                        val = float(val)
+                    except ValueError:
+                        pass
+                if k == "voxels" and isinstance(val, float):
+                    val = int(val)
+                ws.cell(row=i, column=c, value=val)
+        for c in range(1, len(headers) + 1):
+            letter = get_column_letter(c)
+            ws.column_dimensions[letter].width = 15
+        ws.column_dimensions["B"].width = 22
+        ws.column_dimensions["J"].width = 22
+        ws.column_dimensions["M"].width = 30
+        ws.freeze_panes = "A2"
+        try:
+            ws.auto_filter.ref = ws.dimensions
+        except Exception:
+            pass
+
+        from mcp_ssd_vr import config as _cfg
+        _cfg.ensure_dirs()
+        out = os.path.join(_cfg.record_dir(), f"roi_export_{_t.strftime('%Y%m%d_%H%M%S')}.xlsx")
+        try:
+            wb.save(out)
+        except PermissionError:
+            QtWidgets.QMessageBox.warning(self, "导出失败", "目标文件被占用，请关闭后重试。")
+            return
+        msg = f"已导出 {len(rows)} 条 ROI → {out}"
+        self.sam_save_status.setText(msg)
+        self._sam_status(f"Excel 导出完成：{len(rows)} 条", "#88c8a8")
+        res = QtWidgets.QMessageBox.question(
+            self, "导出完成", msg + "\n是否打开所在文件夹？",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.Yes)
+        if res == QtWidgets.QMessageBox.StandardButton.Yes:
+            try:
+                import subprocess
+                subprocess.Popen(["explorer", "/select,", out])
+            except Exception:
+                pass
+
+    # ---------------- 推理 ----------------
+    def _sam_run(self):
+        if self.sam_busy:
+            self.sam_pending = True
+            return
+        vol = self._sam_vol()
+        if vol is None:
+            return
+        if not self.sam_pos_pts:
+            return
+        worker = self._sam_ensure_worker()
+        if worker is None:
+            self.sam_busy = False
+            self.sam_btn_run.setEnabled(True)
+            return
+        self.sam_busy = True
+        self.sam_btn_run.setEnabled(False)
+        self.sam_progress_lb.setText("SAM-Med3D 推理中...")
+        QtWidgets.QApplication.processEvents()
+        thr = float(self.sam_threshold_spin.value())
+        # 负点去重
+        neg = list(dict.fromkeys(self.sam_neg_pts))
+        pos = list(dict.fromkeys(self.sam_pos_pts))
+        self.sam_session.request.emit(np.ascontiguousarray(vol), pos, neg, thr)
+
+    def _sam_on_progress(self, percent, message):
+        if hasattr(self, "sam_progress_lb"):
+            self.sam_progress_lb.setText(f"[{percent}%] {message}")
+        if "加载" in message or "就绪" in message:
+            self._sam_status(message, "#88c8a8")
+
+    def _sam_on_finished(self, mask):
+        self.sam_busy = False
+        self.sam_mask = mask
+        self._sam_write_overlay()
+        self._sam_refresh_views()
+        n = int(mask.sum()) if mask is not None else 0
+        self.sam_progress_lb.setText(f"完成：绿色高亮 {n} 体素 (VR 中显示)")
+        self.sam_btn_run.setEnabled(bool(self.sam_pos_pts))
+        if hasattr(self, "sam_btn_save"):
+            self.sam_btn_save.setEnabled(bool(self.sam_mask is not None and n > 0))
+        if self.sam_pending:
+            self.sam_pending = False
+            QtCore.QTimer.singleShot(0, self._sam_run)
+
+    def _sam_on_error(self, message):
+        self.sam_busy = False
+        self.sam_pending = False
+        self.sam_progress_lb.setText(f"错误: {message}")
+        self.sam_btn_run.setEnabled(bool(self.sam_pos_pts))
+        if not self._mcp_mode:
+            QtWidgets.QMessageBox.warning(self, "SAM 分割失败", message)
+
+    def _sam_write_overlay(self):
+        """把 SAM mask 写入 roi overlay（绿色），在 VR 上高亮。"""
+        mask = self.sam_mask
+        if mask is None:
+            return
+        if not self._ensure_roi_volume():
+            return
+        self._clear_roi_volume()
+        if mask.shape != self.roi_array.shape:
+            # 尺寸不一致则最近邻重采样到 roi_array 网格
+            mask = self._resize_mask_nearest(mask, self.roi_array.shape)
+        target = self.roi_array
+        target[:] = -1024
+        target[mask] = ROI_REPLACEMENT_HU
+        vtk_array = numpy_support.numpy_to_vtk(
+            num_array=target.ravel(order="C"),
+            deep=True,
+            array_type=vtk.VTK_SHORT,
+        )
+        self.roi_image_data.GetPointData().SetScalars(vtk_array)
+        self.roi_image_data.Modified()
+        if self.roi_producer is not None:
+            self.roi_producer.Modified()
+        if self.current_roi_mapper is not None:
+            self.current_roi_mapper.Modified()
+        if self.current_roi_volume is not None:
+            self.current_roi_volume.SetVisibility(True)
+        self.render_window.Render()
+
+    def _sam_clear_overlay(self):
+        if self.current_roi_volume is not None:
+            self._clear_roi_volume()
+            if getattr(self, "render_window", None) is not None:
+                self.render_window.Render()
 
 
 def main() -> int:
@@ -4056,6 +5284,8 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="PySide6 SSD+VR DICOM viewer (Figure 8 style fusion).")
     parser.add_argument("--input", default="", help="DICOM folder path or a single DICOM file")
+    parser.add_argument("--mcp", action="store_true", help="启动 MCP 桥（TCP），供 opencode MCP server 调用")
+    parser.add_argument("--mcp-port", type=int, default=7799, help="MCP 桥端口")
     args = parser.parse_args()
 
     local_weights = os.path.join(os.path.dirname(os.path.abspath(__file__)), "totalseg_weights")
@@ -4076,6 +5306,16 @@ def main() -> int:
 
     win = ViewerWindow(initial_input=initial)
     win.show()
+
+    if args.mcp:
+        win._mcp_mode = True
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            from mcp_ssd_vr.gui_bridge import start_bridge
+            start_bridge(win, args.mcp_port)
+            print(f"[MCP bridge] listening on 127.0.0.1:{args.mcp_port}", flush=True)
+        except Exception as _e:
+            print(f"[MCP bridge] failed to start: {_e}", flush=True)
 
     if os.path.isdir(initial) or os.path.isfile(initial):
         QtCore.QTimer.singleShot(400, win.load_dicom)

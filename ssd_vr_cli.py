@@ -6,6 +6,23 @@ SSD+VR CLI — 无头渲染 + 语义分割自动化工具
   python ssd_vr_cli.py --input /path/to/DICOM --mode cinematic --preset CT-AAA --save-screenshot
   python ssd_vr_cli.py --input /path/to/DICOM --seg --save-seg-masks --save-seg-json
   python ssd_vr_cli.py --input /path/to/DICOM --animate 72 --mode cinematic
+
+必需运行环境（模型/工具直接调用请用此启动）:
+  conda 环境 : mar                     (Python 3.11)
+  解释器     : D:\\python\\envs\\mar\\python.exe
+  依赖       : VTK 9.3.1 / PySide6 6.11.1 / SimpleITK 2.3.1
+               TotalSegmentator 2.16 (含 nnU-Net 权重) / PyRadiomics 3.0.1
+               numpy / scipy / pandas / duckdb / shap / imbalanced-learn
+  GPU        : NVIDIA CUDA (RTX 3080, 10GB); 分割走 device=gpu, 渲染走 VTK GPU 体绘制
+  建议启动前 : --list-presets 验证环境(输出 31 个预设即正常)
+
+  直接调用(工具/模型入口)示例:
+    D:\\python\\envs\\mar\\python.exe I:\\SSD+VR_github\\ssd_vr_cli.py --input <DICOM> --mode cinematic --save-screenshot --output <out>
+  或在 mar 环境内:
+    conda activate mar && python ssd_vr_cli.py --input <DICOM> --mode cinematic --save-screenshot --output <out>
+
+  说明: 默认模式为 CR(cinematic); CR 模式自动做身体包围盒裁剪 + 五点布光 + 深色背景。
+  注意: 输出到含中文/特殊字符路径时, 建议用 ASCII 路径(ITK 写盘限制); 脚本已设 KMP_DUPLICATE_LIB_OK 兼容。
 """
 
 from __future__ import annotations
@@ -22,6 +39,10 @@ import numpy as np
 
 root_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, root_dir)
+# skill 布局: CLI 位于 {skill}/core/, segmentation/ 在 {skill}/ 下 → 把父目录(即 skill_root)也加入, 兼容两处
+_skill_root = os.path.dirname(root_dir)
+if _skill_root not in sys.path:
+    sys.path.insert(0, _skill_root)
 
 # ─── 延迟导入：渲染模块在需要时才加载，允许 --help / --list-presets 无需 VTK/PySide6 ───
 vtk = None          # type: ignore[assignment]
@@ -181,6 +202,121 @@ def load_slicer_presets() -> dict:
 
 SLICER_PRESETS = load_slicer_presets()
 
+# ═══════════════ CR(cinematic) 默认渲染配置：已验证能成功出图 ═══════════════
+CR_MODES = {"cinematic", "nature_channels", "spectral", "dual_volume", "exposure_render",
+            "figure8_channels", "layer_channel", "frangi_channel"}
+# CR 传递函数(取自 ssd_vr_viewer 的 cinematic)
+CINEMATIC_VR_OP = [(-1000, 0.00), (-950, 0.00), (-900, 0.12), (-400, 0.20), (-350, 0.00),
+                   (100, 0.00), (150, 0.60), (250, 0.90), (550, 0.95), (600, 0.00)]
+CINEMATIC_VR_COLOR = [(-1000, 0, 0, 0), (-950, 0.29, 0.00, 0.51), (-400, 0.15, 0.00, 0.35),
+                      (150, 1.00, 0.55, 0.00), (550, 1.00, 0.96, 0.00)]
+CINEMATIC_SSD_OP = [(-1000, 0.00), (150, 0.00), (200, 0.20), (500, 0.70), (1200, 1.00), (3000, 1.00)]
+CINEMATIC_SSD_COLOR = [(-1000, 0, 0, 0), (200, 1.00, 0.99, 0.82), (1200, 1.00, 1.00, 0.94), (3000, 1.00, 1.00, 1.00)]
+# CR 五点布光(强度已降，避免过曝)
+CR_LIGHTS = [
+    ((-0.7, -0.4, 1.0), (1.00, 0.97, 0.93), 1.00),
+    ((0.8, 0.2, 0.5), (0.92, 0.94, 1.00), 0.60),
+    ((0.0, 0.0, -1.2), (0.85, 0.90, 1.00), 0.55),
+    ((0.0, 1.1, 0.4), (1.00, 0.96, 0.90), 0.40),
+    ((0.0, -0.7, 0.0), (0.88, 0.90, 0.95), 0.28),
+]
+
+
+def crop_to_body(image_data, margin=10):
+    """按身体(空气以上)包围盒裁剪，去除空气 padding，让 ResetCamera 填满画面(已验证解决空白/极小)."""
+    from vtkmodules.util import numpy_support as vtk_np
+    dims = image_data.GetDimensions()
+    sp = image_data.GetSpacing(); org = image_data.GetOrigin()
+    arr = vtk_np.vtk_to_numpy(image_data.GetPointData().GetScalars())
+    arr = arr.reshape(dims[2], dims[1], dims[0])
+    body = arr > -400
+    co = np.argwhere(body)
+    if co.size == 0:
+        return image_data
+    z0, z1 = int(co[:, 0].min()), int(co[:, 0].max())
+    y0, y1 = int(co[:, 1].min()), int(co[:, 1].max())
+    x0, x1 = int(co[:, 2].min()), int(co[:, 2].max())
+    m = int(margin)
+    z0 = max(0, z0 - m); z1 = min(arr.shape[0] - 1, z1 + m)
+    y0 = max(0, y0 - m); y1 = min(arr.shape[1] - 1, y1 + m)
+    x0 = max(0, x0 - m); x1 = min(arr.shape[2] - 1, x1 + m)
+    crop = arr[z0:z1 + 1, y0:y1 + 1, x0:x1 + 1]
+    new = vtk.vtkImageData()
+    new.SetDimensions(crop.shape[2], crop.shape[1], crop.shape[0])
+    new.SetSpacing(sp)
+    new.SetOrigin((org[0] + x0 * sp[0], org[1] + y0 * sp[1], org[2] + z0 * sp[2]))
+    dm = image_data.GetDirectionMatrix()
+    new.SetDirectionMatrix(dm)
+    new.GetPointData().SetScalars(vtk_np.numpy_to_vtk(
+        crop.ravel(), deep=True, array_type=image_data.GetScalarType()))
+    return new
+
+
+def _vtk_to_sitk(image_data):
+    """vtkImageData -> SimpleITK 图像(用于检测/分割). 要求标量为数值型, spacing/origin/direction 已设置."""
+    import SimpleITK as sitk
+    import numpy as _np
+    from vtkmodules.util import numpy_support as vtk_np
+    dims = image_data.GetDimensions()
+    arr = vtk_np.vtk_to_numpy(image_data.GetPointData().GetScalars())
+    arr = arr.reshape(dims[2], dims[1], dims[0])
+    img = sitk.GetImageFromArray(arr.astype(_np.int16))
+    img.SetSpacing(image_data.GetSpacing())
+    img.SetOrigin(image_data.GetOrigin())
+    dm = image_data.GetDirectionMatrix()
+    img.SetDirection(tuple(dm.GetElement(i, j) for i in range(3) for j in range(3)))
+    return img
+
+
+def run_segmentation(input_path, image_data, task="total"):
+    """语义分割 -> (results, label_map)。
+    task: total|total_v3|total_mr|brain_structures (TotalSegmentator) 或 synthseg (SynthSeg/DIPY)。
+    results = [ {'region':'全局','bones':[...],'organs':[...],'vessels':[...]} ]; block 为 dict，
+    兼容 ROIMetadataExporter.save_json / SummaryReporter.print_seg_stats。"""
+    import SimpleITK as sitk
+    from segmentation.roi_label_map import TOTALSEG_TOTAL, SYNTHSEG_LABELS
+    try:
+        reader = sitk.ImageSeriesReader()
+        reader.SetFileNames(reader.GetGDCMSeriesFileNames(input_path))
+        sitk_img = reader.Execute()
+    except Exception:
+        sitk_img = _vtk_to_sitk(image_data)
+    spacing = tuple(float(v) for v in sitk_img.GetSpacing()[:3])
+    if task == "synthseg":
+        from segmentation.detectors.synthseg_detector import detect_synthseg
+        label_map, _ = detect_synthseg(sitk_img)
+        label_def = SYNTHSEG_LABELS
+    else:
+        from segmentation.detectors.semantic_detector import detect_semantic
+        label_map = detect_semantic(sitk_img, spacing, task=task)
+        label_def = TOTALSEG_TOTAL
+
+    def block(label_id, anat, cat):
+        mask = (label_map == label_id)
+        n = int(mask.sum())
+        if n == 0:
+            return None
+        vol = round(float(n) * spacing[0] * spacing[1] * spacing[2] / 1000.0, 3)
+        c = np.argwhere(mask)
+        bb = (int(c[:, 0].min()), int(c[:, 0].max()), int(c[:, 1].min()),
+              int(c[:, 1].max()), int(c[:, 2].min()), int(c[:, 2].max()))
+        return {"anatomical_name": anat, "label_id": int(label_id), "category": cat,
+                "volume_cm3": vol, "voxel_count": n,
+                "bbox_z": (bb[0], bb[1] + 1), "bbox_y": (bb[2], bb[3] + 1), "bbox_x": (bb[4], bb[5] + 1)}
+
+    region = {"region": "全局", "bones": [], "organs": [], "vessels": []}
+    for label_id, (anat, cat) in label_def.items():
+        b = block(label_id, anat, cat)
+        if b is None:
+            continue
+        if cat == "bone":
+            region["bones"].append(b)
+        elif cat == "vessel":
+            region["vessels"].append(b)
+        else:
+            region["organs"].append(b)
+    return [region], label_map
+
 
 # ═══════════════════ 模式→光照/材质配置 ═══════════════════
 
@@ -310,6 +446,9 @@ class OffscreenRenderer:
             self.renderer.SetBackground(c[0] / 255, c[1] / 255, c[2] / 255)
         elif background == "dark":
             self.renderer.SetBackground(0.05, 0.05, 0.08)
+        elif self.mode in CR_MODES:
+            # CR 模式默认深色(电影级)，除非用户显式传 #hex
+            self.renderer.SetBackground(0.045, 0.05, 0.07)
         else:
             self.renderer.SetBackground(0.94, 0.95, 0.97)
 
@@ -325,6 +464,9 @@ class OffscreenRenderer:
     # ────────── 体积设置 ──────────
 
     def set_volume(self, image_data: vtk.vtkImageData) -> None:
+        # CR 模式默认裁剪到身体包围盒，保证解剖填满画面(解决空白/过小)
+        if self.mode in CR_MODES:
+            image_data = crop_to_body(image_data)
         self.image_data = image_data
         bounds = image_data.GetBounds()
         self._bounds = bounds
@@ -347,7 +489,7 @@ class OffscreenRenderer:
         ssd_prop = vtk.vtkVolumeProperty()
         ssd_prop.SetInterpolationTypeToLinear()
 
-        # SSD 骨骼 TF（默认）
+        # SSD 骨骼 TF（默认：CR 模式用 cinematic，否则用内置默认）
         if self.preset_name and self.preset_name in SLICER_PRESETS:
             preset = SLICER_PRESETS[self.preset_name]
             self.ssd_opacity_pts = preset["opacity"]
@@ -357,6 +499,9 @@ class OffscreenRenderer:
                 ssd_prop.SetDiffuse(preset["diffuse"])
                 ssd_prop.SetSpecular(preset["specular"])
                 ssd_prop.SetSpecularPower(preset["specularPower"])
+        elif self.mode in CR_MODES:
+            self.ssd_opacity_pts = list(CINEMATIC_SSD_OP)
+            self.ssd_color_pts = list(CINEMATIC_SSD_COLOR)
         else:
             self.ssd_opacity_pts = [(-1000, 0.0), (200, 0.0), (300, 0.3),
                                      (400, 0.6), (800, 0.8), (1300, 1.0), (3000, 1.0)]
@@ -395,15 +540,20 @@ class OffscreenRenderer:
         vr_prop = vtk.vtkVolumeProperty()
         vr_prop.SetInterpolationTypeToLinear()
 
-        self.vr_opacity_pts = [
-            (-1000, 0.0), (140, 0.0), (160, 0.15), (200, 0.35),
-            (280, 0.55), (400, 0.70), (550, 0.80), (3000, 0.80),
-        ]
-        self.vr_color_pts = [
-            (-1000, 0.0, 0.0, 0.0), (150, 1.0, 0.55, 0.0),
-            (250, 1.0, 0.80, 0.20), (400, 1.0, 0.92, 0.50),
-            (550, 1.0, 0.96, 0.0), (3000, 1.0, 1.0, 0.90),
-        ]
+        # VR 默认 TF：CR 模式用 cinematic，否则用内置默认
+        if self.mode in CR_MODES:
+            self.vr_opacity_pts = list(CINEMATIC_VR_OP)
+            self.vr_color_pts = list(CINEMATIC_VR_COLOR)
+        else:
+            self.vr_opacity_pts = [
+                (-1000, 0.0), (140, 0.0), (160, 0.15), (200, 0.35),
+                (280, 0.55), (400, 0.70), (550, 0.80), (3000, 0.80),
+            ]
+            self.vr_color_pts = [
+                (-1000, 0.0, 0.0, 0.0), (150, 1.0, 0.55, 0.0),
+                (250, 1.0, 0.80, 0.20), (400, 1.0, 0.92, 0.50),
+                (550, 1.0, 0.96, 0.0), (3000, 1.0, 1.0, 0.90),
+            ]
 
         # 应用预设到 VR 层（覆盖上述默认值）
         if self.preset_name and self.preset_name in SLICER_PRESETS:
@@ -430,6 +580,9 @@ class OffscreenRenderer:
             self.renderer.AddViewProp(self.ssd_volume)
             self.renderer.AddViewProp(self.vr_volume)
 
+        # ── CR 五点布光(默认开，解决默认光照下体积不可见) ──
+        self._apply_light_rig()
+
         # ── Fusion Controller ──
         self.fusion = FusionController(
             ssd_volume=self.ssd_volume,
@@ -447,12 +600,25 @@ class OffscreenRenderer:
 
     # ────────── 相机 ──────────
 
+    def _apply_light_rig(self) -> None:
+        """五点布光(CR 模式)：key/fill/back/rim/bottom，保证体积渲染可见。"""
+        self.renderer.AutomaticLightCreationOff()
+        self.renderer.RemoveAllLights()
+        for pos, color, inten in CR_LIGHTS:
+            lit = vtk.vtkLight()
+            lit.SetLightTypeToSceneLight(); lit.SetPositional(False)
+            lit.SetPosition(*pos); lit.SetFocalPoint(0, 0, 0)
+            lit.SetColor(*color); lit.SetIntensity(inten)
+            self.renderer.AddLight(lit)
+
     def _apply_camera(self, camera: str) -> None:
         cam = CAMERA_PRESETS.get(camera, CAMERA_PRESETS["coronal"])
         camera_obj = self.renderer.GetActiveCamera()
         camera_obj.SetPosition(cam["pos"])
         camera_obj.SetFocalPoint(cam["target"])
         camera_obj.SetViewUp(cam["up"])
+        # 先设方向，再用 ResetCamera 以体积中心为焦点并适配距离(修复固定焦点(0,0,0)对准空白/角落的问题)
+        self.renderer.ResetCamera()
         self.renderer.ResetCameraClippingRange()
 
     def set_camera_angles(self, pos: tuple, target: tuple, up: tuple) -> None:
@@ -726,9 +892,9 @@ class SummaryReporter:
                     else:
                         n_vessels += 1; vol_vessels += vol
         print(f"[SSD+VR CLI] Semantic segmentation: {np.unique(label_map).size - 1} classes detected")
-        print(f"    Bone:   {n_bones} structures, {vol_bones:.1f} cm³")
-        print(f"    Organ:  {n_organs} structures, {vol_organs:.1f} cm³")
-        print(f"    Vessel: {n_vessels} structures, {vol_vessels:.1f} cm³")
+        print(f"    Bone:   {n_bones} structures, {vol_bones:.1f} cm3")
+        print(f"    Organ:  {n_organs} structures, {vol_organs:.1f} cm3")
+        print(f"    Vessel: {n_vessels} structures, {vol_vessels:.1f} cm3")
 
     @staticmethod
     def print_done(start_time: float, output_dir: str) -> None:
@@ -801,7 +967,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="动画旋转轴 (default: y)")
 
     # ── 语义分割 ──
-    p.add_argument("--seg", action="store_true", help="启用 TotalSegmentator v2 语义分割")
+    p.add_argument("--seg", action="store_true", help="启用语义分割")
+    p.add_argument("--seg-task", default="total",
+                   choices=["total", "total_v3", "total_mr", "brain_structures", "synthseg"],
+                   help="分割任务: total|total_v3|total_mr|brain_structures (TotalSegmentator) 或 synthseg (SynthSeg/DIPY 脑结构, CT/MR)")
     p.add_argument("--save-seg-masks", action="store_true", help="保存分割掩模 (.npz)")
     p.add_argument("--save-seg-json", action="store_true", help="保存 ROI 元数据 (JSON)")
 
@@ -920,7 +1089,7 @@ def process_one(
 
         # Phase 4: 分割
         if args.seg:
-            results, label_map = run_segmentation(input_path, image_data)
+            results, label_map = run_segmentation(input_path, image_data, task=args.seg_task)
             if label_map is not None and args.save_seg_masks:
                 seg_dir = os.path.join(output_dir, "segmentation")
                 MaskExporter(label_map).save_all(seg_dir)
@@ -930,7 +1099,7 @@ def process_one(
                 ROIMetadataExporter.save_json(results, label_map, os.path.join(seg_dir, "roi_metadata.json"))
                 print(f"{prefix}ROI metadata saved")
             if results:
-                SummaryReporter.print_seg_stats(results, label_map or np.zeros((1,)))
+                SummaryReporter.print_seg_stats(results, label_map if label_map is not None else np.zeros((1,)))
 
         elapsed = time.time() - t0
         print(f"{prefix}Done ({elapsed:.1f}s)")

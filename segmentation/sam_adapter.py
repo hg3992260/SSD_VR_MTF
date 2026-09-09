@@ -4,7 +4,11 @@ import sys
 import numpy as np
 import SimpleITK as sitk
 
-from .config import SAM_MED3D_DIR, SAM_CKPT
+from .config import SAM_MED3D_DIR, SAM_CKPT, DEFAULT_THRESHOLD
+
+
+def _fmt_note(msg: str):
+    print(f"[SAMMed3D] {msg}")
 
 
 def _setup_sys_path():
@@ -20,6 +24,8 @@ class SAMMed3DAdapter:
         self.device = device
         self._model = None
         self._loaded = False
+        self._emb_cache_key = None   # (id(vol), shape, z0,y0,x0, ...) 定位 cache
+        self._emb_cache = None       # (emb, pe) GPU 常驻，加速同区域多点 refine
 
     def load_model(self):
 
@@ -194,3 +200,132 @@ class SAMMed3DAdapter:
                 weight[:, :, aW - r:aW] *= rev_ramp[None, None, :]
 
         return weight
+
+    # ------------------------------------------------------------------
+    # 交互式点 prompt 分割（用户点击 → 3D 正/负点 → 全卷 prob/mask）
+    # ------------------------------------------------------------------
+
+    def predict_from_volume(
+        self,
+        vol_zyx: np.ndarray,
+        pts_zyx,
+        neg_pts_zyx=None,
+        threshold: float = None,
+        return_prob: bool = False,
+    ):
+        """对任意形状 int16/float 体积（z,y,x 序）用点 prompt 交互分割。
+
+        vol_zyx    : (D,H,W) numpy，VR 渲染网格同坐标系（输出 mask 与其同形）。
+        pts_zyx    : 正点列表 [(z,y,x), ...]（至少 1 个）。
+        neg_pts_zyx: 负点列表 [(z,y,x), ...]（可选）。
+        采用「以点击区域为中心的 128³ crop」单轮 sparse prompt（SAM-Med3D 原生用法）。
+        返回 (D,H,W) bool mask；return_prob=True 时返回 float prob。
+        """
+        self.ensure_loaded()
+        self._model.eval()
+        import torch
+
+        vol = np.asarray(vol_zyx)
+        if vol.ndim != 3:
+            raise ValueError(f"vol 需为 3D (z,y,x)，得到 {vol.shape}")
+        D, H, W = vol.shape
+        pos = [tuple(int(v) for v in p) for p in (pts_zyx or [])]
+        neg = [tuple(int(v) for v in p) for p in (neg_pts_zyx or [])]
+        if not pos:
+            raise ValueError("需至少 1 个正点")
+
+        # ---- 计算 128³ 窗口（覆盖所有点；锚=正点质心附近，保证包住全部点） ----
+        tile = self.TILE_SIZE
+        all_pts = pos + neg
+        mins = np.min(all_pts, axis=0)
+        maxs = np.max(all_pts, axis=0)
+        span = maxs - mins + 1
+        if np.any(span > tile):
+            _fmt_note(f"点跨度 {tuple(span)} > 128³，将以最后一个正点为中心裁剪，超出部分点忽略")
+            center = np.array(pos[-1])
+            pts_keep = [all_pts[-1]]
+            neg_keep = []
+            # 只保留窗口会覆盖的点（以最后正点为中心的 128 窗口）
+        else:
+            center = (mins + maxs) / 2.0
+            pts_keep = list(pos)
+            neg_keep = list(neg)
+
+        def _wstart(center_c, L):
+            if L <= tile:
+                return 0
+            return int(max(0, min(center_c - tile // 2, L - tile)))
+
+        z0 = _wstart(center[0], D)
+        y0 = _wstart(center[1], H)
+        x0 = _wstart(center[2], W)
+        z1, y1, x1 = min(z0 + tile, D), min(y0 + tile, H), min(x0 + tile, W)
+        aD, aH, aW = z1 - z0, y1 - y0, x1 - x0
+
+        # ---- 取内容块 + 前景归一化(官方: ZNormalization masking x>0) + 补零到 128³ ----
+        content = vol[z0:z1, y0:y1, x0:x1].astype(np.float32)
+        fg = content[content > 0]
+        if fg.size:
+            mean = float(fg.mean())
+            std = float(fg.std())
+        else:
+            mean = float(content.mean())
+            std = float(content.std())
+        if std > 1e-6:
+            content = (content - mean) / std
+        crop = np.zeros((tile, tile, tile), dtype=np.float32)
+        crop[:aD, :aH, :aW] = content
+
+        # ---- 过滤在窗口内的点，转局部坐标 ----
+        local_pts = []
+        local_lbs = []
+        for (z, y, x), lb in [(p, 1) for p in pts_keep] + [(p, 0) for p in neg_keep]:
+            if z0 <= z < z1 and y0 <= y < y1 and x0 <= x < x1:
+                local_pts.append([z - z0, y - y0, x - x0])
+                local_lbs.append(lb)
+        if not local_pts:
+            raise ValueError("窗口内没有有效 prompt 点")
+
+        pts_t = torch.tensor(local_pts, dtype=torch.float32).unsqueeze(0).to(self.device)  # (1,N,3)
+        lbs_t = torch.tensor(local_lbs, dtype=torch.long).unsqueeze(0).to(self.device)     # (1,N)
+
+        roi = torch.from_numpy(crop).unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,128,128,128)
+
+        # ---- image embedding 缓存：同区域多点 refine 只做解码(毫秒级) ----
+        key = (id(vol), vol.shape, z0, y0, x0, aD, aH, aW)
+        cached = self._emb_cache if self._emb_cache is not None and self._emb_cache_key == key else None
+
+        with torch.no_grad():
+            pe = self._model.prompt_encoder.get_dense_pe()
+            if cached is None:
+                image_embeddings = self._model.image_encoder(roi)
+                self._emb_cache = (image_embeddings, pe)
+                self._emb_cache_key = key
+            else:
+                image_embeddings, pe = cached
+            prev_low_res_mask = torch.zeros(
+                (1, 1, tile // 4, tile // 4, tile // 4), dtype=torch.float, device=self.device,
+            )
+            sparse, dense = self._model.prompt_encoder(
+                points=(pts_t, lbs_t), boxes=None, masks=prev_low_res_mask,
+            )
+            low_res_pred, _ = self._model.mask_decoder(
+                image_embeddings=image_embeddings,
+                image_pe=pe,
+                sparse_prompt_embeddings=sparse,
+                dense_prompt_embeddings=dense,
+                multimask_output=False,
+            )
+            prob128 = torch.sigmoid(low_res_pred.float())
+            prob128 = torch.nn.functional.interpolate(
+                prob128, size=(tile, tile, tile), mode="trilinear", align_corners=False,
+            )
+            prob_crop = prob128[0, 0].cpu().numpy()
+
+        full_prob = np.zeros((D, H, W), dtype=np.float32)
+        full_prob[z0:z1, y0:y1, x0:x1] = prob_crop[:aD, :aH, :aW]
+
+        if return_prob:
+            return full_prob
+        thr = DEFAULT_THRESHOLD if threshold is None else float(threshold)
+        return full_prob >= thr

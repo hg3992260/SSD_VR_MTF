@@ -21,6 +21,7 @@ datas:
   - { source: presets.xml,       dest: "." }
   - { source: logo.jpg,          dest: "." }
   - { source: segmentation,      dest: "segmentation" }
+  - { source: mcp_ssd_vr,        dest: "mcp_ssd_vr" }
 
 # ============================================================
 # 二进制依赖 (DLL)
@@ -91,6 +92,19 @@ hidden_imports:
   - nibabel.nifti1
   - nibabel.nifti2
 
+  # — 项目内模块（ROI / MCP 桥）—
+  # 注: 3D SAM(SAM-Med3D/medim) 与 SynthSeg(dipy) 依赖超大，
+  # 基础版不打包，见 build_full.yaml；运行时会给出友好提示。
+  - segmentation.roi_pipeline
+  - segmentation.roi_types
+  - segmentation.roi_label_map
+  - segmentation.detectors.semantic_detector
+  - mcp_ssd_vr.gui_bridge
+  - mcp_ssd_vr.bridge_client
+  - mcp_ssd_vr.state
+  - mcp_ssd_vr.config
+  - mcp_ssd_vr.recorder
+
   # — 图像处理 —
   - skimage
   - skimage.restoration
@@ -141,6 +155,12 @@ excludes:
   - distutils
   - setuptools
   - pip
+  # 3D SAM(SAM-Med3D/medim) 与 SynthSeg(dipy) 大依赖 → 基础版不打包 (build_full.yaml 提供完整版)
+  # 注意: 不排除 torch —— 自动ROI(TotalSegmentator) 运行时需要 torch。
+  - medim
+  - torchio
+  - dipy
+  - monai
 
 # ============================================================
 # CUDA / GPU 加速配置
@@ -174,6 +194,7 @@ build_command: >
     --add-data="presets.xml;."
     --add-data="logo.jpg;."
     --add-data="segmentation;segmentation"
+    --add-data="mcp_ssd_vr;mcp_ssd_vr"
     --add-binary="exposure-render-master/exposure-render-master/Source/build/Release/ErCore.dll;."
     --icon="logo.jpg"
     --collect-all=PySide6
@@ -188,6 +209,19 @@ build_command: >
     --hidden-import=skimage.filters
     --hidden-import=nibabel
     --hidden-import=nibabel.nifti1
+    --hidden-import=segmentation.roi_pipeline
+    --hidden-import=segmentation.roi_types
+    --hidden-import=segmentation.roi_label_map
+    --hidden-import=segmentation.detectors.semantic_detector
+    --hidden-import=mcp_ssd_vr.gui_bridge
+    --hidden-import=mcp_ssd_vr.bridge_client
+    --hidden-import=mcp_ssd_vr.state
+    --hidden-import=mcp_ssd_vr.config
+    --hidden-import=mcp_ssd_vr.recorder
     --exclude-module=tkinter
     --exclude-module=unittest
+    --exclude-module=medim
+    --exclude-module=torchio
+    --exclude-module=dipy
+    --exclude-module=monai
     ssd_vr_viewer.py
