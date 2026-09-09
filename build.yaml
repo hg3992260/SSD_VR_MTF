@@ -144,7 +144,6 @@ collects:
 # ============================================================
 excludes:
   - tkinter
-  - unittest
   - test
   - pydoc
   - email
@@ -155,8 +154,9 @@ excludes:
   - distutils
   - setuptools
   - pip
+  # 注意: 不要排除 unittest —— scipy.ndimage→numpy.testing 运行期需要
   # 3D SAM(SAM-Med3D/medim) 与 SynthSeg(dipy) 大依赖 → 基础版不打包 (build_full.yaml 提供完整版)
-  # 注意: 不排除 torch —— 自动ROI(TotalSegmentator) 运行时需要 torch。
+  # 不排除 torch —— 自动ROI(TotalSegmentator) 运行时需要 torch。
   - medim
   - torchio
   - dipy
@@ -219,7 +219,6 @@ build_command: >
     --hidden-import=mcp_ssd_vr.config
     --hidden-import=mcp_ssd_vr.recorder
     --exclude-module=tkinter
-    --exclude-module=unittest
     --exclude-module=medim
     --exclude-module=torchio
     --exclude-module=dipy
