@@ -11,7 +11,8 @@ nibabel>=5.0.0
 # Segmentation engine
 TotalSegmentator>=2.16.0
 nnunetv2>=2.8.0
-dipy>=1.12.0          # SynthSeg (DIPY 版) 脑结构分割；权重自动下载至 ~/.dipy/synthseg/
+# dipy 需 Python>=3.11 且有 trx-python 依赖，CI(py3.10) 与基础版不装；
+# SynthSeg 可选项 → 在 py3.11+ 环境单独: pip install dipy
 
 # Image processing
 scikit-image>=0.20.0
