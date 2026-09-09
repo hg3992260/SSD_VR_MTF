@@ -16,6 +16,7 @@ dipy>=1.12.0          # SynthSeg (DIPY 版) 脑结构分割；权重自动下载
 # Image processing
 scikit-image>=0.20.0
 matplotlib>=3.7.0
+Pillow>=10.0.0          # PyInstaller --icon 需转 .ico，截图亦用
 
 # GUI theme
 PyCt6>=6.1.0
