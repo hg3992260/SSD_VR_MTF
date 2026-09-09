@@ -51,7 +51,7 @@ jobs:
             "--hidden-import=mcp_ssd_vr.gui_bridge", "--hidden-import=mcp_ssd_vr.bridge_client",
             "--hidden-import=mcp_ssd_vr.state", "--hidden-import=mcp_ssd_vr.config",
             "--hidden-import=mcp_ssd_vr.recorder",
-            "--exclude-module=tkinter", "--exclude-module=unittest",
+            "--exclude-module=tkinter",
             "--exclude-module=medim", "--exclude-module=torchio",
             "--exclude-module=dipy", "--exclude-module=monai"
           )
