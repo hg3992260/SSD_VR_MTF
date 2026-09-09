@@ -24,43 +24,39 @@ jobs:
           pip install pyinstaller
 
       - name: Build EXE
+        shell: pwsh
         run: |
-          pyinstaller --onefile --noconsole `
-            --name="SSD_VR_Fusion_Viewer" `
-            --icon="logo.jpg" `
-            --add-data="scientific.json;." `
-            --add-data="dark.qss;." `
-            --add-data="presets.xml;." `
-            --add-data="logo.jpg;." `
-            --add-data="segmentation;segmentation" `
-            --add-binary="exposure-render-master/exposure-render-master/Source/build/Release/ErCore.dll;." `
-            --collect-all=PySide6 `
-            --collect-all=PyCt6 `
-            --collect-submodules=PyCt6 `
-            --collect-data=PyCt6 `
-            --collect-all=vtkmodules `
-            --collect-all=SimpleITK `
-            --hidden-import=PyCt6 `
-            --hidden-import=PyCt6.widgets.c_button `
-            --hidden-import=PyCt6.widgets.c_label `
-            --hidden-import=PyCt6.widgets.c_line_edit `
-            --hidden-import=PyCt6.widgets.c_combo_box `
-            --hidden-import=PyCt6.widgets.c_slider `
-            --hidden-import=PyCt6.widgets.c_frame `
-            --hidden-import=PyCt6.widgets.c_text_edit `
-            --hidden-import=PyCt6.windows.c_main_window `
-            --hidden-import=PyCt6.windows.c_toplevel `
-            --hidden-import=PyCt6.appearance.theme_manager `
-            --hidden-import=PyCt6.appearance.mode_manager `
-            --hidden-import=PySide6.QtSvg `
-            --hidden-import=PySide6.QtSvgWidgets `
-            --hidden-import=vtkmodules.qt.QVTKRenderWindowInteractor `
-            --hidden-import=scipy.ndimage `
-            --hidden-import=skimage.restoration `
-            --hidden-import=skimage.filters `
-            --hidden-import=nibabel `
-            --exclude-module=tkinter `
-            ssd_vr_viewer.py
+          $er = "exposure-render-master/exposure-render-master/Source/build/Release/ErCore.dll"
+          $args = @(
+            "--onefile", "--noconsole", "--name=SSD_VR_Fusion_Viewer", "--icon=logo.jpg",
+            "--add-data=scientific.json;.", "--add-data=dark.qss;.",
+            "--add-data=presets.xml;.", "--add-data=logo.jpg;.",
+            "--add-data=segmentation;segmentation",
+            "--add-data=mcp_ssd_vr;mcp_ssd_vr",
+            "--collect-all=PySide6", "--collect-all=PyCt6", "--collect-submodules=PyCt6",
+            "--collect-data=PyCt6", "--collect-all=vtkmodules", "--collect-all=SimpleITK",
+            "--hidden-import=PyCt6", "--hidden-import=PyCt6.widgets.c_button",
+            "--hidden-import=PyCt6.widgets.c_label", "--hidden-import=PyCt6.widgets.c_line_edit",
+            "--hidden-import=PyCt6.widgets.c_combo_box", "--hidden-import=PyCt6.widgets.c_slider",
+            "--hidden-import=PyCt6.widgets.c_frame", "--hidden-import=PyCt6.widgets.c_text_edit",
+            "--hidden-import=PyCt6.windows.c_main_window", "--hidden-import=PyCt6.windows.c_toplevel",
+            "--hidden-import=PyCt6.appearance.theme_manager", "--hidden-import=PyCt6.appearance.mode_manager",
+            "--hidden-import=PySide6.QtSvg", "--hidden-import=PySide6.QtSvgWidgets",
+            "--hidden-import=vtkmodules.qt.QVTKRenderWindowInteractor",
+            "--hidden-import=scipy.ndimage", "--hidden-import=skimage.restoration",
+            "--hidden-import=skimage.filters", "--hidden-import=nibabel",
+            "--hidden-import=segmentation.roi_pipeline", "--hidden-import=segmentation.roi_types",
+            "--hidden-import=segmentation.roi_label_map",
+            "--hidden-import=segmentation.detectors.semantic_detector",
+            "--hidden-import=mcp_ssd_vr.gui_bridge", "--hidden-import=mcp_ssd_vr.bridge_client",
+            "--hidden-import=mcp_ssd_vr.state", "--hidden-import=mcp_ssd_vr.config",
+            "--hidden-import=mcp_ssd_vr.recorder",
+            "--exclude-module=tkinter", "--exclude-module=unittest",
+            "--exclude-module=medim", "--exclude-module=torchio",
+            "--exclude-module=dipy", "--exclude-module=monai"
+          )
+          if (Test-Path $er) { $args += "--add-binary=$er;." }
+          pyinstaller @args ssd_vr_viewer.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
