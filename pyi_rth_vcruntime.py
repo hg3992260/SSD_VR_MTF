@@ -20,14 +20,20 @@ def _preload() -> None:
         return
 
     meipass = getattr(sys, "_MEIPASS", "") or os.path.dirname(os.path.abspath(sys.executable))
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
     candidates = [
         meipass,
+        exe_dir,
         os.path.join(meipass, "sklearn", ".libs"),
         os.path.join(meipass, "scipy", ".libs"),
+        os.path.join(meipass, "torch", "lib"),
     ]
 
-    # 顺序：先 vcruntime140_1（可能被 vcruntime140 依赖），再 vcruntime140，再 msvcp/concrt
-    for name in ("vcruntime140_1.dll", "vcruntime140.dll", "msvcp140.dll", "concrt140.dll"):
+    # 顺序关键：先加载被依赖项，再加载 vcomp140/msvcp140 本身。
+    # 一旦 vcomp140.dll 被我们预加载，sklearn 的 WinDLL(vcomp140) 会复用已加载模块，
+    # 从而彻底绕过 Windows DLL 搜索路径问题。
+    for name in ("vcruntime140_1.dll", "vcruntime140.dll", "msvcp140.dll",
+                 "vcomp140.dll", "concrt140.dll"):
         for d in candidates:
             p = os.path.join(d, name)
             if not os.path.isfile(p):
