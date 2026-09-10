@@ -43,6 +43,7 @@ jobs:
           $args = @(
             "--noconfirm", "--clean", "--onedir", "--noconsole",
             "--name=SSD_VR_Fusion_Viewer", "--icon=logo.jpg",
+            "--runtime-hook=pyi_rth_vcruntime.py",
             "--add-data=scientific.json;.", "--add-data=dark.qss;.",
             "--add-data=presets.xml;.", "--add-data=logo.jpg;.",
             "--add-data=segmentation;segmentation",
