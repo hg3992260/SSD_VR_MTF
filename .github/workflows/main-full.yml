@@ -75,16 +75,40 @@ jobs:
           if (Test-Path $er) { $args += "--add-binary=$er;." }
 
           # MSVC 运行库 + sklearn .libs DLL（修复 vcomp140.dll 加载失败）
+          # 注意：sklearn 用 delvewheel 加载器，依赖只在其 .libs 同目录查找，
+          # 因此 vcruntime/msvcp 必须同时放进 sklearn/.libs（以及根目录兜底）。
           $pydir = (python -c "import sys;print(sys.base_prefix)").Trim()
-          foreach ($d in @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","vcomp140.dll","concrt140.dll")) {
+          $msvc = @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","vcomp140.dll","concrt140.dll")
+          foreach ($d in $msvc) {
             $p = Join-Path $pydir $d
-            if (Test-Path $p) { $args += "--add-binary=$p;." }
+            if (Test-Path $p) {
+              $args += "--add-binary=$p;."
+              $args += "--add-binary=$p;sklearn/.libs"
+            }
           }
           $sklibs = (python -c "import sklearn,os;print(os.path.join(os.path.dirname(sklearn.__file__),'.libs'))").Trim()
           if (Test-Path $sklibs) {
-            Get-ChildItem $sklibs -Filter *.dll | ForEach-Object { $args += "--add-binary=$($_.FullName);sklearn/.libs" }
+            Get-ChildItem $sklibs -Filter *.dll | ForEach-Object {
+              $args += "--add-binary=$($_.FullName);sklearn/.libs"
+            }
           }
           pyinstaller @args ssd_vr_viewer.py
+
+      - name: Post-build DLL safety copy
+        shell: pwsh
+        run: |
+          $internal = "dist/SSD_VR_Fusion_Viewer/_internal"
+          $sklibs = Join-Path $internal "sklearn/.libs"
+          New-Item -ItemType Directory -Force -Path $sklibs | Out-Null
+          $pydir = (python -c "import sys;print(sys.base_prefix)").Trim()
+          foreach ($d in @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","vcomp140.dll","concrt140.dll")) {
+            $p = Join-Path $pydir $d
+            if (Test-Path $p) {
+              Copy-Item $p (Join-Path $internal $d) -Force -ErrorAction SilentlyContinue
+              Copy-Item $p (Join-Path $sklibs $d) -Force -ErrorAction SilentlyContinue
+            }
+          }
+          Write-Host "sklearn/.libs contents:"; Get-ChildItem $sklibs -ErrorAction SilentlyContinue | Select-Object Name
 
       - name: Upload FULL package (onedir 目录)
         uses: actions/upload-artifact@v4
