@@ -98,7 +98,8 @@ jobs:
       - name: Post-build DLL safety copy
         shell: pwsh
         run: |
-          $internal = "dist/SSD_VR_Fusion_Viewer/_internal"
+          $top = "dist/SSD_VR_Fusion_Viewer"
+          $internal = "$top/_internal"
           $sklibs = Join-Path $internal "sklearn/.libs"
           New-Item -ItemType Directory -Force -Path $sklibs | Out-Null
           $pydir = (python -c "import sys;print(sys.base_prefix)").Trim()
@@ -107,9 +108,19 @@ jobs:
             if (Test-Path $p) {
               Copy-Item $p (Join-Path $internal $d) -Force -ErrorAction SilentlyContinue
               Copy-Item $p (Join-Path $sklibs $d) -Force -ErrorAction SilentlyContinue
+              Copy-Item $p (Join-Path $top $d) -Force -ErrorAction SilentlyContinue
+            }
+          }
+          # vcomp140/msvcp140 也来自 sklearn wheel 的 .libs：确保存在于 sklearn/.libs 与 EXE 同目录
+          $skw = (python -c "import sklearn,os;print(os.path.join(os.path.dirname(sklearn.__file__),'.libs'))").Trim()
+          if (Test-Path $skw) {
+            Get-ChildItem $skw -Filter *.dll | ForEach-Object {
+              Copy-Item $_.FullName (Join-Path $sklibs $_.Name) -Force -ErrorAction SilentlyContinue
+              Copy-Item $_.FullName (Join-Path $top $_.Name) -Force -ErrorAction SilentlyContinue
             }
           }
           Write-Host "sklearn/.libs contents:"; Get-ChildItem $sklibs -ErrorAction SilentlyContinue | Select-Object Name
+          Write-Host "exe-dir VC DLLs:"; Get-ChildItem $top -Filter *.dll -ErrorAction SilentlyContinue | Select-Object Name
 
       - name: Upload FULL package (onedir 目录)
         uses: actions/upload-artifact@v4
