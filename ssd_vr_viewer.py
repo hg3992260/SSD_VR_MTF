@@ -4638,8 +4638,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._sam_add_point(vox, positive)
 
     def _sam_add_point(self, vox, positive):
-        if self.sam_busy:
-            return
+        # 不再因推理中而丢弃点击：先记录点，若正在推理则排队，完成后再统一重算
         if positive:
             self.sam_pos_pts.append(tuple(int(v) for v in vox))
         else:
@@ -4649,7 +4648,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
             f"正 {len(self.sam_pos_pts)} 负 {len(self.sam_neg_pts)}  最近点 (z={vox[0]},y={vox[1]},x={vox[2]})"
         )
         self.sam_btn_run.setEnabled(True)
-        self._sam_run()
+        if self.sam_busy:
+            self.sam_pending = True
+        else:
+            self._sam_run()
 
     def _sam_undo(self):
         if self.sam_pos_pts:
