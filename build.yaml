@@ -189,6 +189,7 @@ build_command: >
     --name="SSD_VR_Fusion_Viewer"
     --onefile
     --noconsole
+    --runtime-hook="pyi_rth_vcruntime.py"
     --add-data="scientific.json;."
     --add-data="dark.qss;."
     --add-data="presets.xml;."
