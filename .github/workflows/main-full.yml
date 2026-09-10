@@ -1,0 +1,98 @@
+name: Build SSD+VR FULL (GPU + 3D SAM) Windows
+
+# 完整版：CUDA 版 PyTorch(TotalSegmentator GPU) + medim/torchio(3D SAM)
+# 产物：dist/SSD_VR_Fusion_Viewer/ (onedir) 压缩为 SSD_VR_Fusion_Viewer_Full_Win.zip
+# 说明：体积较大(约 2.5-4GB)，故用 onedir+zip 规避 PyInstaller onefile 2GB 限制。
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "ssd_vr_viewer.py"
+      - "segmentation/**"
+      - "mcp_ssd_vr/**"
+      - "requirements*.txt"
+      - "build*.yaml"
+      - ".github/workflows/main-full.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies (base + CUDA torch + medim)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-full.txt
+          pip install pyinstaller
+          python -c "import torch;print('torch',torch.__version__,'cuda',torch.version.cuda,'avail',torch.cuda.is_available())"
+
+      - name: Build FULL EXE (onedir)
+        shell: pwsh
+        run: |
+          $er = "exposure-render-master/exposure-render-master/Source/build/Release/ErCore.dll"
+          $args = @(
+            "--noconfirm", "--clean", "--onedir", "--noconsole",
+            "--name=SSD_VR_Fusion_Viewer", "--icon=logo.jpg",
+            "--add-data=scientific.json;.", "--add-data=dark.qss;.",
+            "--add-data=presets.xml;.", "--add-data=logo.jpg;.",
+            "--add-data=segmentation;segmentation",
+            "--add-data=mcp_ssd_vr;mcp_ssd_vr",
+            "--collect-all=PySide6", "--collect-all=PyCt6", "--collect-submodules=PyCt6",
+            "--collect-data=PyCt6", "--collect-all=vtkmodules", "--collect-all=SimpleITK",
+            "--collect-all=torch", "--collect-all=torchvision",
+            "--collect-all=medim", "--collect-all=torchio", "--collect-all=monai",
+            "--collect-all=totalsegmentator", "--collect-all=nnunetv2",
+            "--hidden-import=PyCt6", "--hidden-import=PyCt6.widgets.c_button",
+            "--hidden-import=PyCt6.widgets.c_label", "--hidden-import=PyCt6.widgets.c_line_edit",
+            "--hidden-import=PyCt6.widgets.c_combo_box", "--hidden-import=PyCt6.widgets.c_slider",
+            "--hidden-import=PyCt6.widgets.c_frame", "--hidden-import=PyCt6.widgets.c_text_edit",
+            "--hidden-import=PyCt6.windows.c_main_window", "--hidden-import=PyCt6.windows.c_toplevel",
+            "--hidden-import=PyCt6.appearance.theme_manager", "--hidden-import=PyCt6.appearance.mode_manager",
+            "--hidden-import=PySide6.QtSvg", "--hidden-import=PySide6.QtSvgWidgets",
+            "--hidden-import=vtkmodules.qt.QVTKRenderWindowInteractor",
+            "--hidden-import=scipy.ndimage", "--hidden-import=skimage.restoration",
+            "--hidden-import=skimage.filters", "--hidden-import=nibabel",
+            "--hidden-import=segmentation.roi_pipeline", "--hidden-import=segmentation.roi_types",
+            "--hidden-import=segmentation.roi_label_map",
+            "--hidden-import=segmentation.detectors.semantic_detector",
+            "--hidden-import=segmentation.sam_pipeline", "--hidden-import=segmentation.sam_adapter",
+            "--hidden-import=mcp_ssd_vr.gui_bridge", "--hidden-import=mcp_ssd_vr.bridge_client",
+            "--hidden-import=mcp_ssd_vr.state", "--hidden-import=mcp_ssd_vr.config",
+            "--hidden-import=mcp_ssd_vr.recorder",
+            "--exclude-module=tkinter"
+          )
+          if (Test-Path $er) { $args += "--add-binary=$er;." }
+          pyinstaller @args ssd_vr_viewer.py
+
+      - name: Upload FULL package (onedir 目录)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSD_VR_Fusion_Viewer_Full_Win
+          path: dist/SSD_VR_Fusion_Viewer/
+          compression-level: 0
+          retention-days: 14
+
+      - name: Release (tag only, zip)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/SSD_VR_Fusion_Viewer/*" -DestinationPath "dist/SSD_VR_Fusion_Viewer_Full_Win.zip" -CompressionLevel Optimal
+        continue-on-error: true
+
+      - name: Upload release asset (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          files: dist/SSD_VR_Fusion_Viewer_Full_Win.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
