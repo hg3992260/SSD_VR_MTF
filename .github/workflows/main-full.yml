@@ -52,6 +52,7 @@ jobs:
             "--collect-all=torch", "--collect-all=torchvision",
             "--collect-all=medim", "--collect-all=torchio", "--collect-all=monai",
             "--collect-all=totalsegmentator", "--collect-all=nnunetv2",
+            "--collect-all=sklearn", "--collect-all=joblib",
             "--hidden-import=PyCt6", "--hidden-import=PyCt6.widgets.c_button",
             "--hidden-import=PyCt6.widgets.c_label", "--hidden-import=PyCt6.widgets.c_line_edit",
             "--hidden-import=PyCt6.widgets.c_combo_box", "--hidden-import=PyCt6.widgets.c_slider",
@@ -72,6 +73,17 @@ jobs:
             "--exclude-module=tkinter"
           )
           if (Test-Path $er) { $args += "--add-binary=$er;." }
+
+          # MSVC 运行库 + sklearn .libs DLL（修复 vcomp140.dll 加载失败）
+          $pydir = (python -c "import sys;print(sys.base_prefix)").Trim()
+          foreach ($d in @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","vcomp140.dll","concrt140.dll")) {
+            $p = Join-Path $pydir $d
+            if (Test-Path $p) { $args += "--add-binary=$p;." }
+          }
+          $sklibs = (python -c "import sklearn,os;print(os.path.join(os.path.dirname(sklearn.__file__),'.libs'))").Trim()
+          if (Test-Path $sklibs) {
+            Get-ChildItem $sklibs -Filter *.dll | ForEach-Object { $args += "--add-binary=$($_.FullName);sklearn/.libs" }
+          }
           pyinstaller @args ssd_vr_viewer.py
 
       - name: Upload FULL package (onedir 目录)
