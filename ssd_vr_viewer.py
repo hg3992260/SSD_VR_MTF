@@ -1,9 +1,16 @@
-import argparse
+﻿import argparse
 import importlib.util
 import os
 import sys
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+def _external_dir() -> str:
+    """外部可写目录：冻结(EXE)时=EXE 所在目录，否则=源码目录。用于权重/外部脚本。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return current_dir
 
 # Inject the pv_packages directory into sys.path to allow pvpython to find PyQt5 and SimpleITK
 if sys.platform == "win32":
@@ -1999,7 +2006,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def _run_kedge_preprocess(self) -> None:
         from vtkmodules.util import numpy_support
         import subprocess, sys
-        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kedge_preprocess.py")
+        script_path = os.path.join(_external_dir(), "kedge_preprocess.py")
         if not os.path.exists(script_path):
             QtWidgets.QMessageBox.warning(self, "脚本不存在", "kedge_preprocess.py 未找到。")
             return
@@ -3980,7 +3987,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def _on_browse_weights(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "选择 TotalSegmentator 权重文件夹",
                self.roi_weight_edit.text().strip() or
-               os.path.join(os.path.dirname(os.path.abspath(__file__)), "totalseg_weights"))
+               os.path.join(_external_dir(), "totalseg_weights"))
         if d:
             self.roi_weight_edit.setText(d)
 
@@ -4005,7 +4012,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         we = self.roi_weight_edit
         for p in [
             os.environ.get("nnUNet_results", ""),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "totalseg_weights"),
+            os.path.join(_external_dir(), "totalseg_weights"),
         ]:
             if os.path.isdir(p):
                 we.setText(p)
@@ -5288,7 +5295,7 @@ def main() -> int:
     parser.add_argument("--mcp-port", type=int, default=7799, help="MCP 桥端口")
     args = parser.parse_args()
 
-    local_weights = os.path.join(os.path.dirname(os.path.abspath(__file__)), "totalseg_weights")
+    local_weights = os.path.join(_external_dir(), "totalseg_weights")
     if os.path.isdir(local_weights):
         os.environ["nnUNet_results"] = local_weights
 

@@ -33,10 +33,16 @@ class SAMMed3DAdapter:
             return
         import medim
 
+        # 权重缺失时回退到 HuggingFace 自动下载（medim 支持 URL），
+        # 便于冻结版 EXE 首次运行自足获取 ~383MB 权重。
+        ckpt = self.checkpoint_path
+        if not (ckpt and os.path.exists(ckpt)):
+            ckpt = "https://huggingface.co/blueyo0/SAM-Med3D/blob/main/sam_med3d_turbo.pth"
+            _fmt_note(f"本地权重不存在，改用 HuggingFace 自动下载: {ckpt}")
         self._model = medim.create_model(
             "SAM-Med3D",
             pretrained=True,
-            checkpoint_path=self.checkpoint_path,
+            checkpoint_path=ckpt,
         )
         self._model = self._model.to(self.device)
         self._loaded = True
