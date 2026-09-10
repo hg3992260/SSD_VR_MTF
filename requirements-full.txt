@@ -1,19 +1,14 @@
 # ============================================================
 # 完整版依赖（GPU 加速 + 3D SAM / SAM-Med3D）
 # 用法:
-#   pip install -r requirements-full.txt
-# 说明:
-#   - 基于基础 requirements.txt
-#   - torch 从 PyTorch CUDA 源安装 (cu124)，使 TotalSegmentator 走 GPU
-#   - medim/torchio 供 3D SAM(SAM-Med3D) 使用
-#   - 首次运行 3D SAM 需下载权重: python download_sam_med3d.py
+#   1) 先装 CUDA 版 PyTorch（必须用 --index-url，否则会装成 CPU 版）:
+#        pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+#   2) 再装本文件:
+#        pip install -r requirements-full.txt
+#   3) 首次运行 3D SAM 自动下载权重 (~383MB)，或先跑: python download_sam_med3d.py
+# 说明: torch 不写在本文件内（避免被 PyPI 的 CPU 轮子覆盖）。
 # ============================================================
 -r requirements.txt
-
-# CUDA 版 PyTorch (Windows/Linux, CUDA 12.4)
---extra-index-url https://download.pytorch.org/whl/cu124
-torch>=2.6.0
-torchvision>=0.21.0
 
 # 3D SAM (SAM-Med3D) 运行时
 medim>=0.1.2
