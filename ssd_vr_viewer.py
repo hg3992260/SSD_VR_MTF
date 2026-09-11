@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import importlib.util
 import os
 import sys
@@ -5334,4 +5334,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # PyInstaller 冻结版必需，且必须是 __main__ 里的第一条语句。
+    #
+    # nnU-Net / TotalSegmentator 会用 multiprocessing.get_context("spawn").Pool
+    # 导出分割结果（见 totalsegmentator/nnunet_runtime_patches.py:316）。
+    # 不调用 freeze_support() 时，spawn 的 worker 会重新执行本 EXE 的入口，
+    # 也就是把整个 Qt GUI 再启动一遍，而不是去跑 worker 目标函数，
+    # 于是 Pool 永远拿不到结果 → 卡在 10%、GPU 全程 0%。
+    #
+    # 源码运行时这里是无害的 no-op（无 sys.frozen 时 freeze_support 直接返回），
+    # 所以"源码正常、EXE 卡死"正是这个差异造成的。
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     sys.exit(main())

@@ -10,6 +10,16 @@
 import os
 import sys
 
+# --- 冻结版环境变量：必须在任何第三方库（torch / numpy / sklearn）导入之前生效 ---
+#
+# 不加这一行，Intel OpenMP 运行库的重复初始化会直接 abort 掉整个进程
+# （在源码环境实测 exit code 3）：
+#   OMP: Error #15: Initializing libiomp5md.dll, but found libiomp5md.dll
+#                  already initialized.
+# 源码里靠 sklearn/__init__.py、segmentation/sam_adapter.py 里的 setdefault 兜住，
+# 但冻结版里谁先导入并不确定；放在 runtime hook 最稳——它在主脚本之前执行。
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 
 def _preload() -> None:
     if os.name != "nt":
