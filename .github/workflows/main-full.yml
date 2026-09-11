@@ -144,6 +144,17 @@ jobs:
 
           pyinstaller @args ssd_vr_viewer.py
 
+      - name: Fix + verify bundle DLL dependencies
+        shell: pwsh
+        run: |
+          # 修 cc3d 那一类问题：cc3d\fastcc3d*.pyd 依赖 delvewheel 改名的
+          # msvcp140-a4c2229bdc2a2a630acdc095b4d86008.dll，而 PyInstaller 按文件名
+          # 去重，把它放进了 pandas.libs\（另一个包的目录）→ 运行时报
+          #   ImportError: DLL load failed while importing fastcc3d: 找不到指定的模块
+          # --flatten 会把这类 mangled DLL 摊到 _internal\ 根目录（loader 必定搜到，
+          # 不再依赖导入顺序）；同时对"引用了但整个包都找不到"的情况直接硬失败。
+          python tools/check_bundle_dlls.py dist/SSD_VR_Fusion_Viewer --flatten
+
       - name: Verify bundle (fail fast on missing VC/OpenMP runtime)
         shell: pwsh
         run: |
