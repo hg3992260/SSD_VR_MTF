@@ -64,5 +64,50 @@ def _preload() -> None:
             except Exception:
                 pass
 
+    # --- 注册**所有** delvewheel 的 .libs 目录 -------------------------------
+    #
+    # delvewheel 会把依赖改名成 <name>-<32位十六进制哈希>.dll；PyInstaller 按
+    # 文件名去重，于是某个包的 .pyd 需要的 DLL 可能被放进**另一个包**的 .libs。
+    # 实例：cc3d\fastcc3d.cp310-win_amd64.pyd 依赖
+    #   msvcp140-a4c2229bdc2a2a630acdc095b4d86008.dll
+    # 而它只存在于 _internal\pandas.libs\，所以 import cc3d 直接抛
+    #   ImportError: DLL load failed while importing fastcc3d: 找不到指定的模块。
+    # 只有 pandas 恰好先被导入时才会碰巧成功 —— 典型的顺序依赖。
+    # 预先注册全部 .libs 目录后，PE 导入表在任何导入顺序下都能解析。
+    # （构建期还会用 tools/check_bundle_dlls.py --flatten 把它们摊到
+    #    _internal\ 根目录，这里是第二道保险。）
+    def _register_libs(root: str) -> None:
+        if not os.path.isdir(root):
+            return
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            return
+        for name in entries:
+            p = os.path.join(root, name)
+            if not os.path.isdir(p):
+                continue
+            if name.endswith(".libs"):            # _internal\pandas.libs
+                try:
+                    _handles.append(os.add_dll_directory(p))
+                except Exception:
+                    pass
+                continue
+            # 再下一层：_internal\sklearn\.libs
+            try:
+                for sub in os.listdir(p):
+                    if sub.endswith(".libs"):
+                        q = os.path.join(p, sub)
+                        if os.path.isdir(q):
+                            try:
+                                _handles.append(os.add_dll_directory(q))
+                            except Exception:
+                                pass
+            except OSError:
+                pass
+
+    for _root in (meipass, exe_dir):
+        _register_libs(_root)
+
 
 _preload()
