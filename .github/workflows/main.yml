@@ -29,6 +29,7 @@ jobs:
           $er = "exposure-render-master/exposure-render-master/Source/build/Release/ErCore.dll"
           $args = @(
             "--onefile", "--noconsole", "--name=SSD_VR_Fusion_Viewer", "--icon=logo.jpg",
+            "--runtime-hook=pyi_rth_vcruntime.py",
             "--add-data=scientific.json;.", "--add-data=dark.qss;.",
             "--add-data=presets.xml;.", "--add-data=logo.jpg;.",
             "--add-data=segmentation;segmentation",
@@ -56,6 +57,48 @@ jobs:
             "--exclude-module=dipy", "--exclude-module=monai"
           )
           if (Test-Path $er) { $args += "--add-binary=$er;." }
+
+          # ============================================================
+          # 修复 PyInstallerImportError: Failed to load dynlib/dll
+          #   ...\sklearn\.libs\vcomp140.dll
+          # sklearn/_distributor_init.py 无条件 WinDLL(<sklearn>/.libs/vcomp140.dll)，
+          # 而 .libs 是点开头的隐藏目录，分发/打包环节容易把它丢掉。
+          # PyInstaller 的 pyimod03_ctypes._frozen_name() 在原路径不存在时，
+          # 会回退到 $MEIPASS\<basename>；把运行库放进 $MEIPASS 根目录即可兜底。
+          # ============================================================
+          $pyBase = (python -c "import sys;print(sys.base_prefix)").Trim()
+          $skLibs = ""
+          try {
+            $skLibs = (python -c "import sklearn,os;print(os.path.join(os.path.dirname(sklearn.__file__),'.libs'))" 2>$null).Trim()
+          } catch { $skLibs = "" }
+
+          $searchDirs = @()
+          if ($skLibs) { $searchDirs += $skLibs }
+          $searchDirs += $pyBase
+          $searchDirs += (Join-Path $env:SystemRoot "System32")
+
+          $placed = @()
+          foreach ($d in @("vcomp140.dll","msvcp140.dll","vcruntime140.dll","vcruntime140_1.dll")) {
+            $src = $null
+            foreach ($dir in $searchDirs) {
+              if (-not $dir) { continue }
+              $cand = Join-Path $dir $d
+              if (Test-Path -LiteralPath $cand) { $src = $cand; break }
+            }
+            if ($src) {
+              $args += "--add-binary=$src;."
+              $placed += $d
+            } else {
+              Write-Warning "找不到运行库: $d"
+            }
+          }
+          Write-Host ("staged into `$MEIPASS: " + ($placed -join ", "))
+          foreach ($need in @("vcomp140.dll","msvcp140.dll")) {
+            if ($placed -notcontains $need) {
+              throw "$need 在 sklearn/.libs、Python 目录、System32 中均未找到，无法避免 sklearn 导入失败。"
+            }
+          }
+
           pyinstaller @args ssd_vr_viewer.py
 
       - name: Upload EXE

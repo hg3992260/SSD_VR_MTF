@@ -75,58 +75,120 @@ jobs:
           )
           if (Test-Path $er) { $args += "--add-binary=$er;." }
 
-          # MSVC 运行库 + sklearn .libs DLL（修复 vcomp140.dll 加载失败）
-          # 注意：sklearn 用 delvewheel 加载器，依赖只在其 .libs 同目录查找，
-          # 因此 vcruntime/msvcp 必须同时放进 sklearn/.libs（以及根目录兜底）。
-          $pydir = (python -c "import sys;print(sys.base_prefix)").Trim()
-          $msvc = @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","vcomp140.dll","concrt140.dll")
-          foreach ($d in $msvc) {
-            $p = Join-Path $pydir $d
-            if (Test-Path $p) {
-              $args += "--add-binary=$p;."
-              $args += "--add-binary=$p;sklearn/.libs"
-            }
-          }
-          $sklibs = (python -c "import sklearn,os;print(os.path.join(os.path.dirname(sklearn.__file__),'.libs'))").Trim()
-          if (Test-Path $sklibs) {
-            Get-ChildItem $sklibs -Filter *.dll | ForEach-Object {
+          # ============================================================
+          # 修复 PyInstallerImportError:
+          #   Failed to load dynlib/dll '...\_internal\sklearn\.libs\vcomp140.dll'
+          #
+          # sklearn 的 _distributor_init.py 会**无条件**执行（没有 os.path.isfile 检查）：
+          #     WinDLL(abspath(<sklearn>/.libs/vcomp140.dll))
+          #     WinDLL(abspath(<sklearn>/.libs/msvcp140.dll))
+          #
+          # 而 sklearn 的 .libs 是以点开头的**隐藏目录**，会被分发环节静默丢掉：
+          #   * actions/upload-artifact@v4 默认 include-hidden-files: false
+          #   * Compress-Archive / Get-ChildItem 递归同样跳过隐藏项
+          # 用户拿到的包里就没有 _internal\sklearn\.libs\，绝对路径加载必然失败。
+          # （对比：numpy.libs / scipy.libs 不带点，所以它们活了下来。）
+          #
+          # PyInstaller 的 ctypes 补丁 pyimod03_ctypes._frozen_name() 有一层兜底：
+          #   若原路径不存在、且 $MEIPASS\<basename> 存在，就改用后者。
+          # 所以把运行库**同时**放进 $MEIPASS 根目录（onedir 下即 _internal\），
+          # 就能彻底免疫“隐藏目录被丢弃”，sklearn\.libs 仍保留为首选路径。
+          # ============================================================
+          $pyBase = (python -c "import sys;print(sys.base_prefix)").Trim()
+          $skLibs = ""
+          try {
+            $skLibs = (python -c "import sklearn,os;print(os.path.join(os.path.dirname(sklearn.__file__),'.libs'))" 2>$null).Trim()
+          } catch { $skLibs = "" }
+
+          # (1) 原样保留 sklearn 自带 .libs 布局（delvewheel 首选加载路径）
+          if ($skLibs -and (Test-Path -LiteralPath $skLibs)) {
+            Write-Host "sklearn .libs: $skLibs"
+            Get-ChildItem -LiteralPath $skLibs -Filter *.dll | ForEach-Object {
+              Write-Host ("  staged  {0}  ({1} bytes)" -f $_.Name, $_.Length)
               $args += "--add-binary=$($_.FullName);sklearn/.libs"
             }
+          } else {
+            Write-Warning "sklearn/.libs 不存在，仅依赖 `$MEIPASS basename 兜底"
           }
+
+          # (2) 关键兜底：运行库放进 _internal\（= $MEIPASS 根目录）
+          #     来源优先级 sklearn/.libs（与 sklearn 匹配的版本）> Python 目录 > System32
+          $searchDirs = @()
+          if ($skLibs) { $searchDirs += $skLibs }
+          $searchDirs += $pyBase
+          $searchDirs += (Join-Path $env:SystemRoot "System32")
+
+          $placed = @()
+          foreach ($d in @("vcomp140.dll","msvcp140.dll","vcruntime140.dll","vcruntime140_1.dll")) {
+            $src = $null
+            foreach ($dir in $searchDirs) {
+              if (-not $dir) { continue }
+              $cand = Join-Path $dir $d
+              if (Test-Path -LiteralPath $cand) { $src = $cand; break }
+            }
+            if ($src) {
+              $args += "--add-binary=$src;."
+              $placed += [pscustomobject]@{ Dll = $d; Source = $src }
+            } else {
+              Write-Warning "找不到运行库: $d"
+            }
+          }
+          Write-Host "--- VC/OpenMP DLLs staged into `$MEIPASS (_internal) ---"
+          $placed | Format-Table -AutoSize
+
+          foreach ($need in @("vcomp140.dll","msvcp140.dll")) {
+            if (@($placed | Where-Object { $_.Dll -eq $need }).Count -eq 0) {
+              throw "$need 在 sklearn/.libs、Python 目录、System32 中均未找到，无法避免 sklearn 导入失败。"
+            }
+          }
+
           pyinstaller @args ssd_vr_viewer.py
 
-      - name: Post-build DLL safety copy
+      - name: Verify bundle (fail fast on missing VC/OpenMP runtime)
         shell: pwsh
         run: |
           $top = "dist/SSD_VR_Fusion_Viewer"
           $internal = "$top/_internal"
           $sklibs = Join-Path $internal "sklearn/.libs"
+
+          # 尽力恢复 sklearn 原生 .libs 布局。注意：这**不是**关键路径，
+          # 真正的保障是 _internal\ 根目录里的 vcomp140/msvcp140（$MEIPASS 兜底）。
           New-Item -ItemType Directory -Force -Path $sklibs | Out-Null
-          $pydir = (python -c "import sys;print(sys.base_prefix)").Trim()
-          foreach ($d in @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","vcomp140.dll","concrt140.dll")) {
-            $p = Join-Path $pydir $d
-            if (Test-Path $p) {
-              Copy-Item $p (Join-Path $internal $d) -Force -ErrorAction SilentlyContinue
-              Copy-Item $p (Join-Path $sklibs $d) -Force -ErrorAction SilentlyContinue
-              Copy-Item $p (Join-Path $top $d) -Force -ErrorAction SilentlyContinue
+          foreach ($d in @("vcomp140.dll","msvcp140.dll","vcruntime140.dll","vcruntime140_1.dll")) {
+            $src = Join-Path $internal $d
+            if (Test-Path -LiteralPath $src) {
+              Copy-Item -LiteralPath $src -Destination (Join-Path $sklibs $d) -Force -ErrorAction SilentlyContinue
+              if (-not (Test-Path -LiteralPath (Join-Path $top $d))) {
+                Copy-Item -LiteralPath $src -Destination (Join-Path $top $d) -Force -ErrorAction SilentlyContinue
+              }
             }
           }
-          # vcomp140/msvcp140 也来自 sklearn wheel 的 .libs：确保存在于 sklearn/.libs 与 EXE 同目录
-          $skw = (python -c "import sklearn,os;print(os.path.join(os.path.dirname(sklearn.__file__),'.libs'))").Trim()
-          if (Test-Path $skw) {
-            Get-ChildItem $skw -Filter *.dll | ForEach-Object {
-              Copy-Item $_.FullName (Join-Path $sklibs $_.Name) -Force -ErrorAction SilentlyContinue
-              Copy-Item $_.FullName (Join-Path $top $_.Name) -Force -ErrorAction SilentlyContinue
-            }
+
+          Write-Host "--- _internal root VC/OpenMP dlls (必须含 vcomp140 + msvcp140) ---"
+          Get-ChildItem -LiteralPath $internal -Filter *.dll -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^(vcruntime140|msvcp140|vcomp140)' } |
+            Select-Object Name, Length | Format-Table -AutoSize
+          Write-Host "--- _internal\sklearn\.libs ---"
+          Get-ChildItem -LiteralPath $sklibs -ErrorAction SilentlyContinue |
+            Select-Object Name, Length | Format-Table -AutoSize
+
+          $missing = @()
+          foreach ($d in @("vcomp140.dll","msvcp140.dll")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $internal $d))) { $missing += "_internal/$d" }
           }
-          Write-Host "sklearn/.libs contents:"; Get-ChildItem $sklibs -ErrorAction SilentlyContinue | Select-Object Name
-          Write-Host "exe-dir VC DLLs:"; Get-ChildItem $top -Filter *.dll -ErrorAction SilentlyContinue | Select-Object Name
+          if ($missing.Count -gt 0) {
+            throw "缺少关键运行库: $($missing -join ', ') —— sklearn 导入时会再次报 PyInstallerImportError"
+          }
+          Write-Host "OK: `$MEIPASS 根目录已包含 vcomp140.dll / msvcp140.dll"
 
       - name: Upload FULL package (onedir 目录)
         uses: actions/upload-artifact@v4
         with:
           name: SSD_VR_Fusion_Viewer_Full_Win
           path: dist/SSD_VR_Fusion_Viewer/
+          # 必须为 true：PyInstaller 产物里的 .libs 是点开头的隐藏目录，
+          # v4.4.0 起 upload-artifact 默认把它排除，正是本次报错的根因之一。
+          include-hidden-files: true
           compression-level: 0
           retention-days: 14
 
@@ -134,7 +196,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
-          Compress-Archive -Path "dist/SSD_VR_Fusion_Viewer/*" -DestinationPath "dist/SSD_VR_Fusion_Viewer_Full_Win.zip" -CompressionLevel Optimal
+          # Compress-Archive 会跳过隐藏项（如 sklearn\.libs），
+          # 改用 bsdtar：它会把点开头的目录一并打包。
+          Push-Location "dist/SSD_VR_Fusion_Viewer"
+          tar.exe -a -c -f "../SSD_VR_Fusion_Viewer_Full_Win.zip" .
+          Pop-Location
+          Get-Item "dist/SSD_VR_Fusion_Viewer_Full_Win.zip" | Select-Object FullName, Length
         continue-on-error: true
 
       - name: Upload release asset (tag only)
