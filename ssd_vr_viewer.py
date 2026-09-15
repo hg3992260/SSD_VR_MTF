@@ -2333,7 +2333,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.pat_tree = QtWidgets.QTreeWidget()
         self.pat_tree.setColumnCount(6)
         self.pat_tree.setHeaderLabels(
-            ["病人 / 序列", "状态", "ID / 模态", "检查日期", "层数", "大小MB"])
+            ["病人 / 序列", "VR", "ID / 模态", "检查日期", "层数", "大小MB"])
         self.pat_tree.setRootIsDecorated(True)
         self.pat_tree.setUniformRowHeights(True)
         self.pat_tree.setSelectionBehavior(
@@ -2349,7 +2349,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         _hdr = self.pat_tree.header()
         _hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
         _hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
-        self.pat_tree.setColumnWidth(1, 30)
+        self.pat_tree.setColumnWidth(1, 46)
         self.pat_tree.itemClicked.connect(self._patient_tree_clicked)
         parent_layout.addWidget(self.pat_tree, 1)
 
@@ -2434,22 +2434,39 @@ class ViewerWindow(QtWidgets.QMainWindow):
             p_it.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"kind": "patient"})
 
             for s in p["series"]:
-                warn = bool(s["warnings"])
+                vr = s.get("vr") or {}
+                vr_level = vr.get("level", "warn")
                 s_it = QtWidgets.QTreeWidgetItem(p_it)
                 s_it.setIcon(0, self._pat_icon("series"))
-                s_it.setIcon(1, self._pat_icon("warn" if warn else "ok"))
+                # 第 1 列 = VR 校验结论（可 / 慎 / 否）
+                s_it.setIcon(1, self._pat_icon(f"vr_{vr_level}"))
+                s_it.setText(1, {"ok": "可", "warn": "慎", "block": "否"}.get(vr_level, "?"))
                 s_it.setIcon(2, self._modality_badge(s["modality"]))
                 s_it.setText(0, s["description"])
                 s_it.setText(2, s["modality"] or "—")
                 s_it.setText(3, s["study_date"] or "")
                 s_it.setText(4, str(s["file_count"]))
                 s_it.setText(5, f"{s['size_mb']:g}")
+
                 tip = (f"目录: {s['folder']}\n"
                        f"序列UID: {s['series_uid'] or '—'}\n"
                        f"层数: {s['file_count']}    大小: {s['size_mb']:g} MB\n"
                        f"涉及文件夹数: {len(s['folders'])}")
-                if warn:
-                    tip += "\n提示: " + "、".join(s["warnings"])
+                # VR 校验详情
+                vr_head = {"ok": "VR 校验：可以体渲染",
+                           "warn": "VR 校验：可以渲染，但有折扣",
+                           "block": "VR 校验：无法体渲染"}.get(vr_level, "VR 校验：未知")
+                tip += f"\n\n{vr_head}"
+                if vr.get("rows") and vr.get("cols"):
+                    tip += (f"\n  尺寸 {vr['rows']}x{vr['cols']}  "
+                            f"层数 {vr.get('slices')}  "
+                            f"体素 {vr.get('voxels', 0) / 1e6:.1f}M")
+                for _r in (vr.get("reasons") or []):
+                    tip += f"\n  ✗ {_r}"
+                for _w in (vr.get("warnings") or []):
+                    tip += f"\n  ⚠ {_w}"
+                if s.get("warnings"):
+                    tip += "\n其他提示: " + "、".join(s["warnings"])
                 if s.get("split_multi_folder"):
                     tip += (f"\n注意: 该序列分散在 {len(s['folders'])} 个文件夹，"
                             f"加载时使用层数最多的：\n  {s.get('load_folder', s['folder'])}")
@@ -2458,7 +2475,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
                              {"kind": "series",
                               "folder": s.get("load_folder") or s["folder"],
                               "label": f"{p['display_name']} / {s['description']}",
-                              "split": bool(s.get("split_multi_folder"))})
+                              "split": bool(s.get("split_multi_folder")),
+                              "vr": vr})
 
         if len(self._pat_patients) <= 40:
             tree.expandAll()
@@ -2486,6 +2504,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
             "series": sp.SP_FileIcon,
             "warn": sp.SP_MessageBoxWarning,
             "ok": sp.SP_DialogApplyButton,
+            # VR 校验三档
+            "vr_ok": sp.SP_DialogApplyButton,
+            "vr_warn": sp.SP_MessageBoxWarning,
+            "vr_block": sp.SP_MessageBoxCritical,
         }
         try:
             return self.style().standardIcon(table.get(kind, sp.SP_FileIcon))
@@ -2542,7 +2564,41 @@ class ViewerWindow(QtWidgets.QMainWindow):
         label = data.get("label") or folder
         if data.get("split"):
             label += "（序列分散在多个文件夹，已取层数最多的那个）"
+        # VR 校验：判定"无法体渲染"的先拦一道，别让用户白等一次加载
+        vr = data.get("vr") or {}
+        if vr.get("level") == "block" and not self._confirm_vr_block(label, vr):
+            return
+        if vr.get("level") == "warn":
+            label += "（VR 校验有提示，悬停列表可看详情）"
         self._queue_series_load(folder, label)
+
+    def _confirm_vr_block(self, label: str, vr: dict) -> bool:
+        """VR 校验判定"不可体渲染"时先确认一次。返回 True 表示用户仍要尝试。"""
+        reasons = vr.get("reasons") or []
+        self._mcp_push("error", {"error": "vr_check_blocked",
+                                 "label": label, "reasons": reasons})
+        if self._mcp_mode:                      # 自动化模式不弹模态框
+            self.pat_status.setText(
+                f"VR 校验未通过，未加载：{label} —— " + "；".join(reasons))
+            return False
+
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("VR 校验未通过")
+        box.setText(f"「{label}」可能无法进行 VR 体渲染。")
+        box.setInformativeText("· " + "\n· ".join(reasons) + "\n\n仍然尝试加载？")
+        btn_try = box.addButton("仍然尝试",
+                                QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        btn_cancel = box.addButton("取消",
+                                   QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_cancel)        # 默认不加载
+        box.exec()
+
+        if box.clickedButton() is btn_try:
+            self.pat_status.setText(f"已忽略 VR 校验结论，继续加载：{label}")
+            return True
+        self.pat_status.setText(f"已取消（VR 校验未通过）：{label}")
+        return False
 
     def _queue_series_load(self, folder: str, label: str) -> None:
         """登记加载请求并去抖——**关键：不在这里直接调用 load_dicom**。

@@ -191,6 +191,54 @@ _SKIP_DIR = frozenset((
     "node_modules", "__pycache__", "recycler",
 ))
 
+# ---- VR(体渲染)可行性判定用到的常量 ----
+# 能做体渲染的模态：必须是断层成像，才有第三维
+VR_CAPABLE_MODALITIES = frozenset(("CT", "MR", "PT", "NM", "CBCT", "CTP"))
+# 明确是二维投影 / 非图像对象，做不了体渲染
+VR_NON_VOLUME_MODALITIES = frozenset((
+    "US", "CR", "DX", "MG", "IO", "PX", "RF", "XA", "SC", "SR", "PR", "KO",
+    "DOC", "AU", "ECG", "ES", "FID", "GM", "HD", "LEN", "LS", "OP", "PLAN",
+    "REG", "RTIMAGE", "RTPLAN", "RTSTRUCT", "RTDOSE", "SEG",
+))
+# 定位像 / 扫描计划图：几何上虽属断层，但层数极少且角度特殊，做 VR 没意义
+_LOCALIZER_HINTS = (
+    "scout", "localizer", "localiser", "topogram", "topo", "pilot", "survey",
+    "scanogram", "surview", "定位", "正位", "侧位",
+)
+
+
+def _is_dicom_file(full: str, ext: str) -> bool:
+    """DICOM 判定。参照 RSNA dicom_analysis_tool/dicom_cluster.py::_is_dicom_file。
+
+    相比只看 DICM 魔数的改进：无扩展名/未知扩展名的文件在魔数不匹配时，
+    再用 pydicom 探测关键标签兜底 —— 没有 128 字节 part-10 前导的 DICOM
+    （部分导出工具会产生）只有这样才认得出来。
+    """
+    try:
+        size = os.path.getsize(full)
+    except OSError:
+        return False
+    if size < 132:
+        return False
+    if ext == "dcm":
+        return True
+    if ext in _SKIP_EXT:
+        return False
+    try:
+        with open(full, "rb") as fh:
+            if fh.read(132)[128:132] == b"DICM":
+                return True
+    except OSError:
+        return False
+    try:
+        ds = pydicom.dcmread(full, stop_before_pixels=True, force=True)
+    except Exception:
+        return False
+    for tag in ("SOPClassUID", "PatientName", "Modality", "StudyInstanceUID"):
+        if hasattr(ds, tag):
+            return True
+    return getattr(ds, "file_meta", None) is not None
+
 
 def _fmt_dicom_date(raw: Any) -> str:
     s = str(raw or "")
@@ -219,8 +267,9 @@ def _read_head(path: str) -> Optional[Dict[str, str]]:
 def _folder_dicom_files(folder: str, max_files: int = 50000) -> List[str]:
     """目录**直接**含有的 DICOM 文件（不递归）。
 
-    对无扩展名的文件只探测第一个候选的 DICM 魔数，避免逐个开文件；
-    探测结果为否时，该目录下所有无扩展名文件都视为非 DICOM。
+    性能取舍：`.dcm` 后缀直接认；其余后缀只在**第一个候选**上做一次完整判定
+    （DICM 魔数 + pydicom 标签兜底，见 _is_dicom_file），判为"是"就把该目录下
+    同类文件都收进来，判为"否"就都跳过 —— 避免逐个开文件拖慢大目录扫描。
     """
     try:
         names = sorted(os.listdir(folder))
@@ -228,7 +277,7 @@ def _folder_dicom_files(folder: str, max_files: int = 50000) -> List[str]:
         return []
 
     out: List[str] = []
-    magic_ok: Optional[bool] = None
+    candidate_ok: Optional[bool] = None
     for fn in names:
         full = os.path.join(folder, fn)
         if not os.path.isfile(full):
@@ -240,14 +289,23 @@ def _folder_dicom_files(folder: str, max_files: int = 50000) -> List[str]:
             ext = low.rsplit(".", 1)[-1] if "." in low else ""
             if ext in _SKIP_EXT:
                 continue
-            if magic_ok is None:
-                magic_ok = _looks_like_dicom(full)
-            if not magic_ok:
+            if candidate_ok is None:
+                candidate_ok = _is_dicom_file(full, ext)
+            if not candidate_ok:
                 continue
             out.append(full)
         if len(out) >= max_files:
             break
     return out
+
+
+def _spread_sample(files: List[str], k: int) -> List[str]:
+    """从列表里均匀取 k 个样本（首/中/尾），供后续几何 / VR 校验使用。"""
+    n = len(files)
+    if n <= k or k <= 1:
+        return list(files[:k]) if k >= 1 else []
+    idx = sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
+    return [files[i] for i in idx]
 
 
 def _series_from_files(folder: str, files: List[str],
@@ -276,6 +334,7 @@ def _series_from_files(folder: str, files: List[str],
         "file_count": len(files),
         "size_mb": round(total / (1024 * 1024), 1),
         "warnings": warnings,
+        "sample_files": _spread_sample(files, 3),
     }
 
 
@@ -306,8 +365,11 @@ def _probe_folder_series(folder: str, files: List[str]) -> List[Dict[str, Any]]:
 def _walk_dicom_folders(root: str, max_depth: int, max_folders: int):
     """递归找出所有"直接含 DICOM 文件"的目录 -> [(folder, [files]), ...]
 
-    某目录一旦含有 DICOM 文件就当作叶子（不再往里钻），
-    避免把序列目录里的备份/子目录重复计入。
+    改进（参照 RSNA dicom_analysis_tool 的全量遍历）：**不再剪枝**。
+    遇到含 DICOM 的目录后仍然继续下钻 —— 否则像
+        root/PAT_A/*.dcm  +  root/PAT_A/seq2/*.dcm
+    这种"同一层既有散文件又有子序列"的布局会漏掉深层序列。
+    重复文件由外层按 SeriesInstanceUID 合并处理。
     """
     found: List[Any] = []
     root_abs = os.path.abspath(root)
@@ -322,10 +384,146 @@ def _walk_dicom_folders(root: str, max_depth: int, max_folders: int):
         files = _folder_dicom_files(dirpath)
         if files:
             found.append((dirpath, files))
-            dirnames[:] = []            # 叶子：不再下钻
             if len(found) >= max_folders:
                 break
     return found
+
+
+# ---------------------------------------------------------------------------
+# VR(体渲染)可行性校验
+#
+# "能读出来"不等于"能做 VR"：体渲染需要真正的三维体数据。这里在**列表阶段**
+# 就给出判定，免得用户点了半天才发现这条序列根本渲染不了。
+# 三档结论：
+#   ok    —— 可以体渲染
+#   warn  —— 可以渲染，但质量/性能有折扣（原因写进 warnings）
+#   block —— 无法体渲染（二维投影、单层、定位像、几何不一致…）
+# ---------------------------------------------------------------------------
+
+def _read_vr_tags(path: str) -> Optional[Dict[str, Any]]:
+    """读 VR 判定所需的几何/类型标签（不读像素）。"""
+    try:
+        ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
+    except Exception:
+        return None
+
+    def _num(v, i=None):
+        try:
+            return float(v[i]) if i is not None else float(v)
+        except Exception:
+            return None
+
+    ps = getattr(ds, "PixelSpacing", None)
+    iop = getattr(ds, "ImageOrientationPatient", None)
+    itype = getattr(ds, "ImageType", None)
+    return {
+        "rows": int(getattr(ds, "Rows", 0) or 0),
+        "cols": int(getattr(ds, "Columns", 0) or 0),
+        "frames": int(getattr(ds, "NumberOfFrames", 0) or 0),
+        "bits": int(getattr(ds, "BitsAllocated", 0) or 0),
+        "pixel_spacing": ([_num(ps, 0), _num(ps, 1)]
+                          if ps is not None and len(ps) >= 2 else None),
+        "slice_thickness": _num(getattr(ds, "SliceThickness", None)),
+        "spacing_between": _num(getattr(ds, "SpacingBetweenSlices", None)),
+        "orientation": (tuple(round(float(v), 2) for v in iop[:6])
+                        if iop is not None and len(iop) >= 6 else None),
+        "modality": str(getattr(ds, "Modality", "") or ""),
+        "series_desc": str(getattr(ds, "SeriesDescription", "") or ""),
+        "body_part": str(getattr(ds, "BodyPartExamined", "") or ""),
+        "image_type": "\\".join(str(x) for x in itype) if itype is not None else "",
+        "patient_position": str(getattr(ds, "PatientPosition", "") or ""),
+    }
+
+
+def check_vr_renderable(samples: List[str], file_count: int,
+                        series_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """判断一条序列能否做 VR 体渲染。samples 为该序列的若干代表文件。"""
+    meta = series_meta or {}
+    tags = [t for t in (_read_vr_tags(p) for p in samples) if t]
+    head = tags[0] if tags else {}
+
+    reasons: List[str] = []
+    warnings: List[str] = []
+
+    modality = (meta.get("modality") or head.get("modality") or "").strip().upper()
+    desc = (meta.get("description") or head.get("series_desc") or "").strip()
+    blob = " ".join((desc, head.get("body_part", ""), head.get("image_type", ""),
+                     head.get("patient_position", ""))).lower()
+
+    rows = head.get("rows") or 0
+    cols = head.get("cols") or 0
+    frames = head.get("frames") or 0
+    slices = max(file_count, frames) if frames else file_count
+
+    # 1) 模态 —— 二维投影 / 非图像对象做不了体渲染
+    if modality in VR_NON_VOLUME_MODALITIES:
+        reasons.append(f"模态 {modality} 是二维投影或非图像对象，没有第三维")
+    elif modality and modality not in VR_CAPABLE_MODALITIES:
+        warnings.append(f"模态 {modality} 不是常规断层模态，体渲染结果可能无意义")
+
+    # 2) 层数
+    if slices < 2:
+        reasons.append(f"只有 {slices} 层，构不成体数据")
+    elif slices < 8:
+        warnings.append(f"仅 {slices} 层，体渲染会很粗糙")
+
+    # 3) 必须是像素图像
+    if not tags:
+        reasons.append("读不到任何 DICOM 头，无法校验几何")
+    elif rows <= 0 or cols <= 0:
+        reasons.append("缺少 Rows/Columns，不是像素图像（可能是 SR / RTSTRUCT 等）")
+
+    # 4) 定位像 / 扫描计划图
+    hit = next((h for h in _LOCALIZER_HINTS if h in blob), "")
+    if hit:
+        reasons.append(f"看起来是定位像/扫描计划图（命中 '{hit}'）")
+
+    # 5) 同一序列内的几何一致性
+    if len(tags) >= 2:
+        dims = {(t["rows"], t["cols"]) for t in tags if t["rows"] and t["cols"]}
+        if len(dims) > 1:
+            reasons.append(f"同序列内图像尺寸不一致 {sorted(dims)}，拼不成规则体数据")
+        oris = {t["orientation"] for t in tags if t["orientation"]}
+        if len(oris) > 1:
+            warnings.append("同序列内方向矩阵不一致，体素可能倾斜/错层")
+        sps = {tuple(t["pixel_spacing"]) for t in tags if t["pixel_spacing"]}
+        if len(sps) > 1:
+            warnings.append("同序列内 PixelSpacing 不一致，层内会被拉伸")
+
+    # 6) 各向异性（层厚 vs 层内分辨率）
+    sp_xy = head.get("pixel_spacing")
+    sz = head.get("spacing_between") or head.get("slice_thickness")
+    if sp_xy and sp_xy[0] and sz:
+        ratio = sz / sp_xy[0]
+        if ratio >= 3:
+            warnings.append(f"层厚 {sz:g}mm 远大于层内 {sp_xy[0]:g}mm"
+                            f"（各向异性 {ratio:.1f}:1），VR 有明显阶梯感")
+        elif ratio >= 2:
+            warnings.append(f"各向异性 {ratio:.1f}:1，VR 精细结构略受影响")
+
+    # 7) 体素规模（与渲染器的自动下采样阈值对齐：200M / 500M）
+    voxels = rows * cols * slices if (rows and cols) else 0
+    bits = head.get("bits") or 16
+    est_mb = round(voxels * max(bits, 8) / 8 / (1024 * 1024), 1)
+    if voxels > 500_000_000:
+        warnings.append(f"约 {voxels / 1e6:.0f}M 体素（>500M），会自动下采样，细节有损失")
+    elif voxels > 200_000_000:
+        warnings.append(f"约 {voxels / 1e6:.0f}M 体素，显存压力较大")
+
+    return {
+        "level": "block" if reasons else ("warn" if warnings else "ok"),
+        "ok": not reasons,
+        "reasons": reasons,
+        "warnings": warnings,
+        "slices": slices,
+        "rows": rows,
+        "cols": cols,
+        "spacing_xy": sp_xy,
+        "spacing_z": sz,
+        "voxels": voxels,
+        "est_mb": est_mb,
+        "modality": modality,
+    }
 
 
 def scan_patients(root: str, max_depth: int = 6,
@@ -366,6 +564,11 @@ def scan_patients(root: str, max_depth: int = 6,
                 m["folders"].append(s["folder"])
             m["folder_counts"][s["folder"]] = (
                 m["folder_counts"].get(s["folder"], 0) + s["file_count"])
+            # 跨目录序列：把各目录的样本合起来，VR 校验才能看到整体几何
+            _sf = list(m.get("sample_files") or [])
+            if len(_sf) < 6:
+                _sf.extend(x for x in (s.get("sample_files") or []) if x not in _sf)
+                m["sample_files"] = _sf[:6]
         else:
             merged[key] = dict(s, folders=[s["folder"]],
                                folder_counts={s["folder"]: s["file_count"]})
@@ -376,6 +579,9 @@ def scan_patients(root: str, max_depth: int = 6,
         fc = m["folder_counts"]
         m["load_folder"] = max(fc, key=fc.get) if fc else m["folder"]
         m["split_multi_folder"] = len(m["folders"]) > 1
+        # VR 可行性 / 质量校验（列表阶段就给出结论）
+        m["vr"] = check_vr_renderable(
+            m.get("sample_files") or [], m["file_count"], m)
 
     # 归成病人
     patients: Dict[str, Dict[str, Any]] = {}
@@ -405,17 +611,24 @@ def scan_patients(root: str, max_depth: int = 6,
     for p in patients.values():
         p["series"].sort(key=lambda s: (-s["file_count"], s["description"]))
         p["series_count"] = len(p["series"])
+        p["vr_ok"] = sum(1 for s in p["series"] if s["vr"]["level"] == "ok")
+        p["vr_warn"] = sum(1 for s in p["series"] if s["vr"]["level"] == "warn")
+        p["vr_block"] = sum(1 for s in p["series"] if s["vr"]["level"] == "block")
         p["display_name"] = (p["patient_name"] or p["patient_id"]
                              or os.path.basename(
                                  os.path.normpath(p["series"][0]["folder"])))
         out.append(p)
     out.sort(key=lambda p: (p["study_date"] or "", p["display_name"]))
 
+    all_series = [s for p in out for s in p["series"]]
     return {
         "ok": True,
         "root": os.path.abspath(root),
         "patient_count": len(out),
-        "series_count": sum(p["series_count"] for p in out),
+        "series_count": len(all_series),
         "folder_count": len(folders),
+        "vr_ok": sum(1 for s in all_series if s["vr"]["level"] == "ok"),
+        "vr_warn": sum(1 for s in all_series if s["vr"]["level"] == "warn"),
+        "vr_block": sum(1 for s in all_series if s["vr"]["level"] == "block"),
         "patients": out,
     }
