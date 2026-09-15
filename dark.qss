@@ -213,6 +213,30 @@ QScrollBar::add-line, QScrollBar::sub-line {
     width: 0px;
 }
 
+/* ============================================================
+   分隔条 (QSplitter): 左侧参数栏 ↔ 右侧渲染视图
+   默认样式的把手只有 1-4 像素且没有配色，深色主题下几乎看不见、
+   也抓不住，用起来就像"分隔栏不能拖"。这里明确给宽度 + 配色 +
+   hover/pressed 反馈，让它成为一个明显的可拖动把手。
+   ============================================================ */
+QSplitter::handle {
+    background: #14060a;
+}
+QSplitter::handle:horizontal {
+    width: 8px;
+    background: #401824;
+}
+QSplitter::handle:vertical {
+    height: 8px;
+    background: #401824;
+}
+QSplitter::handle:horizontal:hover, QSplitter::handle:vertical:hover {
+    background: #a04a68;
+}
+QSplitter::handle:horizontal:pressed, QSplitter::handle:vertical:pressed {
+    background: #e07090;
+}
+
 QLabel {
     color: #ece0e4;
     background: transparent;

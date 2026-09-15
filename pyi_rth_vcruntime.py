@@ -21,6 +21,36 @@ import sys
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 
+# --- 标准流编码兜底：必须最早执行（runtime hook 先于主脚本）-----------------
+#
+# --noconsole 打包时 sys.stdout/stderr 为 None。若后来用 open(os.devnull, "w")
+# 兜底（不带 encoding），会落到系统 ANSI 代码页：中文 Windows = cp936 能编中文，
+# 但**英文版 Windows Server 是 cp1252**，任何中文 print 都会抛
+#   UnicodeEncodeError: 'charmap' codec can't encode characters ...
+# 而 build_reader() 里有大量中文 print，异常最终被 load_dicom 捕获成
+# "DICOM 加载或渲染失败"，让人误以为是渲染器坏了。
+# 这里在最早时机把流修好；主脚本 main() 里还会再兜一次。
+def _fix_std_streams() -> None:
+    try:
+        for name in ("stdout", "stderr"):
+            stream = getattr(sys, name, None)
+            if stream is None:
+                setattr(sys, name, open(os.devnull, "w",
+                                        encoding="utf-8", errors="replace"))
+                continue
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None:
+                try:
+                    reconfigure(errors="replace")   # 只放宽 errors，不改编码
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+_fix_std_streams()
+
+
 def _preload() -> None:
     if os.name != "nt":
         return

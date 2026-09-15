@@ -47,12 +47,22 @@ def _launch_gui(dicom_path: Optional[str] = None) -> Dict[str, Any]:
 
     logf = open(config.gui_log_path(), "ab", buffering=0)  # noqa: SIM115
 
+    # Windows 兼容：torch 的 libiomp5md.dll 与 vtk/SimpleITK 的 OpenMP 重复初始化会导致
+    # TotalSegmentator 在 Qt 线程里 import torch 时崩溃（QThread destroyed while running）。
+    # 同时把 stdout 编码强制为 utf-8，避免 print('1024³') 触发 GBK 编码崩溃。
+    env = os.environ.copy()
+    env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
+
     try:
         proc = subprocess.Popen(
             cmd,
             stdout=logf,
             stderr=subprocess.STDOUT,
             cwd=config.repo_root(),
+            env=env,
         )
     except Exception as e:
         return {"ok": False, "error": f"启动 GUI 进程失败: {e}"}

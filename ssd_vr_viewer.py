@@ -220,6 +220,10 @@ import tempfile
 from vtkmodules.util import numpy_support
 import numpy as np
 
+
+class _RenderCancelled(Exception):
+    """用户选择「终止渲染」时，从 load_dicom 的取消检查点抛出。"""
+
 from segmentation.roi_pipeline import ROIPipeline
 
 HAS_MC_RDENOISER = False
@@ -1015,6 +1019,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         self.initial_input = initial_input or ""
         self.load_busy = False
+        self.load_cancel = False        # True = 用户要求终止当前渲染
+        self._pending_load = None       # 排队等待的下一个序列 (path, label)
+        self._loading_label = ""        # 当前正在渲染的对象，供冲突提示显示
+        self._pat_pending_request = None  # 点击后待执行的加载请求 (folder, label)
+        # 点击去抖：连点多个序列时只加载最后一个，避免排队一串过期加载
+        self._pat_debounce = QtCore.QTimer(self)
+        self._pat_debounce.setSingleShot(True)
+        self._pat_debounce.setInterval(250)
+        self._pat_debounce.timeout.connect(self._pat_flush_request)
         self.last_error = None
         self._mcp_mode = False
         self._mcp_bridge = None
@@ -1539,23 +1552,74 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.pages = QtWidgets.QTabWidget()
 
         # === Tab 0: 渲染 (Render) ===
+        # 渲染页内部再分两个**子页面**（QStackedWidget），顶部两个小标签切换：
+        #   0 = 病人列表   —— 选病例，替代原来的「选文件夹 / 选文件」
+        #   1 = 渲染参数   —— 路径框 + 加载渲染 + 全部参数
+        # 下面把 render_layout 重新绑定到「渲染参数」子页，
+        # 因此后续几十个 render_layout.addWidget(...) 无需改动即自动归入子页 1。
         render_page = QtWidgets.QWidget()
-        render_layout = QtWidgets.QVBoxLayout(render_page)
-        render_layout.setContentsMargins(4, 2, 4, 2)
-        render_layout.setSpacing(1)
+        render_outer = QtWidgets.QVBoxLayout(render_page)
+        render_outer.setContentsMargins(4, 2, 4, 2)
+        render_outer.setSpacing(3)
 
-        # --- 路径输入 ---
-        self.path_edit = CLineEdit(master=render_page, placeholder_text="DICOM 目录路径，或选择单个 .dcm 文件...")
+        # --- 子页面切换条（自绘分段控件，不依赖主题配色）---
+        _seg_qss = (
+            "QPushButton { background:#1c0a12; color:#b098a0;"
+            " border:1px solid #2e121c; border-radius:3px;"
+            " padding:3px 10px; font-weight:700; font-size:9pt; }"
+            "QPushButton:hover:!checked { background:#2a121c; color:#d4c0c8; }"
+            "QPushButton:checked { background:#782838; color:#ffffff;"
+            " border:1px solid #8a3448; }")
+        _bar = QtWidgets.QWidget()
+        _bar_lay = QtWidgets.QHBoxLayout(_bar)
+        _bar_lay.setContentsMargins(0, 0, 0, 0)
+        _bar_lay.setSpacing(2)
+        self.subtab_patient = QtWidgets.QPushButton("病人列表")
+        self.subtab_params = QtWidgets.QPushButton("渲染参数")
+        for _b in (self.subtab_patient, self.subtab_params):
+            _b.setCheckable(True)
+            _b.setAutoExclusive(True)          # 同一父控件，互斥
+            _b.setMinimumHeight(24)
+            _b.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            _b.setStyleSheet(_seg_qss)
+            _bar_lay.addWidget(_b)
+        _bar_lay.addStretch(1)
+        render_outer.addWidget(_bar)
+
+        self.render_stack = QtWidgets.QStackedWidget()
+        render_outer.addWidget(self.render_stack, 1)
+
+        # --- 子页面 0：病人列表 ---
+        patient_page = QtWidgets.QWidget()
+        patient_layout = QtWidgets.QVBoxLayout(patient_page)
+        patient_layout.setContentsMargins(0, 0, 0, 0)
+        patient_layout.setSpacing(4)
+        self.render_stack.addWidget(patient_page)
+        self._build_patient_section(patient_page, patient_layout)
+
+        # --- 子页面 1：渲染参数（以下所有控件都进这一页）---
+        params_page = QtWidgets.QWidget()
+        render_layout = QtWidgets.QVBoxLayout(params_page)
+        render_layout.setContentsMargins(0, 0, 0, 0)
+        render_layout.setSpacing(1)
+        self.render_stack.addWidget(params_page)
+
+        self.subtab_patient.toggled.connect(
+            lambda on: self.render_stack.setCurrentIndex(0) if on else None)
+        self.subtab_params.toggled.connect(
+            lambda on: self.render_stack.setCurrentIndex(1) if on else None)
+        self.subtab_patient.setChecked(True)   # 默认停在「病人列表」
+
+        # --- 路径输入（「选文件夹 / 选文件」已由上面的病人列表取代）---
+        self.path_edit = CLineEdit(
+            master=params_page,
+            placeholder_text="DICOM 目录路径（从「病人列表」选择，或在此直接填写）...")
         render_layout.addWidget(self.path_edit)
         btn_row = QtWidgets.QHBoxLayout()
-        self.btn_pick_dir = CButton(master=render_page, width=66, text="选文件夹", command=self.pick_dir)
-        self.btn_pick_file = CButton(master=render_page, width=56, text="选文件", command=self.pick_file)
-        self.btn_load = CButton(master=render_page, width=66, text="加载渲染", command=self.load_dicom,
+        self.btn_load = CButton(master=params_page, width=66, text="加载渲染", command=self.load_dicom,
                                  background_color=("#782838", "#8a3448"),
                                  hover_color=("#8e3848", "#9e4858"),
                                  text_color=("#ffffff", "#ffffff"))
-        btn_row.addWidget(self.btn_pick_dir)
-        btn_row.addWidget(self.btn_pick_file)
         btn_row.addWidget(self.btn_load)
         btn_row.addStretch()
         render_layout.addLayout(btn_row)
@@ -1921,15 +1985,32 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.pages.addTab(kedge_page, "PCCT K-edge")
 
         # Split layout: left=tabs+controls, right=VTK render
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        splitter.addWidget(self.pages)
+        #
+        # 关于"分隔栏能不能拖"：QSplitter 的把手默认只有 1-4 像素、且没有任何
+        # 配色，在深色主题下几乎看不见也抓不住 —— 用起来就等同于"分隔栏不能拖"。
+        # 这里显式给把手宽度 + 两侧最小宽度，并配合 dark.qss 里的
+        # QSplitter::handle 配色 / hover / pressed 反馈，
+        # 让它成为一个明显、好抓、可左右拖动的把手。
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+
+        # 两侧各留一个可用下限：参数栏不至于被压到看不见控件，
+        # 渲染视图也不至于被压成一条缝（配合 setChildrenCollapsible(False)）。
+        self.pages.setMinimumWidth(300)
+        self.splitter.addWidget(self.pages)
 
         self.vtk_widget = QVTKRenderWindowInteractor(central)
-        splitter.addWidget(self.vtk_widget)
-        splitter.setSizes([480, 1040])
-        splitter.setChildrenCollapsible(False)
+        self.vtk_widget.setMinimumWidth(320)
+        self.splitter.addWidget(self.vtk_widget)
 
-        root_layout.addWidget(splitter, 1)
+        self.splitter.setHandleWidth(8)        # 可抓取宽度（默认太窄）
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setOpaqueResize(True)    # 拖动过程中实时重排，VTK 视图跟着变
+        self.splitter.setSizes([480, 1040])    # 初始比例
+        # 窗口整体变大时，把多出来的宽度给渲染视图（参数栏保持拖动后的宽度）
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+
+        root_layout.addWidget(self.splitter, 1)
 
         self.setCentralWidget(central)
 
@@ -2203,6 +2284,348 @@ class ViewerWindow(QtWidgets.QMainWindow):
         )
         if selected:
             self.path_edit.line_edit().setText(selected)
+
+    # ==================================================================
+    # 「病人列表」页（左侧参数栏的第一个页签，位于「渲染」之前）
+    #
+    # 扫描根目录默认取「渲染」页已填的路径（也可手动改/另选）。
+    # 根目录下每个子文件夹视为一个病人/病例；双击一行 = 把该病例路径
+    # 填回渲染页并复用 load_dicom() 直接加载。
+    # 扫描逻辑在 mcp_ssd_vr/dicom.py::scan_patients()，只读 DICOM 头，很快。
+    # ==================================================================
+    def _build_patient_section(self, page, parent_layout) -> None:
+        """渲染页的**子页面 0**：病人列表（取代原来的「选文件夹 / 选文件」）。
+
+        两级树：**病人 → 序列**。扫描结果由 DICOM 标签决定，与目录怎么嵌套无关。
+        单击任一**序列**即加载，并自动切到默认「稳定渲染模式 (CPU/基础)」。
+        """
+        tip = QtWidgets.QLabel(
+            "智能递归扫描：按 DICOM 标签归成「病人 → 序列」两级，与目录嵌套方式无关。\n"
+            "单击一个序列 → 自动填入路径、切到「稳定渲染模式 (CPU/基础)」并加载。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#88b0c8; font-size:11px;")
+        parent_layout.addWidget(tip)
+
+        parent_layout.addWidget(QtWidgets.QLabel("扫描根目录"))
+        self.pat_root_edit = CLineEdit(master=page,
+                                       placeholder_text="放病人数据的根目录...")
+        parent_layout.addWidget(self.pat_root_edit)
+
+        row = QtWidgets.QHBoxLayout()
+        self.btn_pat_pick_root = CButton(master=page, width=80, text="选根目录",
+                                         command=self._patient_pick_root)
+        self.btn_pat_sync = CButton(master=page, width=90, text="用当前路径",
+                                    command=self._patient_sync_from_render_path)
+        self.btn_pat_scan = CButton(master=page, width=60, text="扫描",
+                                    command=self._patient_scan)
+        self.btn_pat_expand = CButton(master=page, width=50, text="展开",
+                                      command=self._patient_expand_all)
+        self.btn_pat_collapse = CButton(master=page, width=50, text="折叠",
+                                        command=self._patient_collapse_all)
+        for _b in (self.btn_pat_pick_root, self.btn_pat_sync, self.btn_pat_scan,
+                   self.btn_pat_expand, self.btn_pat_collapse):
+            row.addWidget(_b)
+        row.addStretch(1)
+        parent_layout.addLayout(row)
+
+        # 两级树。三处图标元素：类型图标(第0列) + 状态图标(第1列) + 模态色块(第2列)。
+        # 用 QStyle 标准图标与 QPainter 自绘色块，不依赖 emoji 字体，任何机器都能显示。
+        self.pat_tree = QtWidgets.QTreeWidget()
+        self.pat_tree.setColumnCount(6)
+        self.pat_tree.setHeaderLabels(
+            ["病人 / 序列", "状态", "ID / 模态", "检查日期", "层数", "大小MB"])
+        self.pat_tree.setRootIsDecorated(True)
+        self.pat_tree.setUniformRowHeights(True)
+        self.pat_tree.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.pat_tree.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.pat_tree.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.pat_tree.setStyleSheet(
+            "QTreeWidget::item:selected { background:#2f7fd0; color:#ffffff; }"
+            "QTreeWidget::item:selected:!active { background:#26527f; color:#e8f0ff; }"
+            "QTreeWidget::item:hover { background:#1d3b5a; }")
+        self.pat_tree.setMaximumHeight(280)
+        _hdr = self.pat_tree.header()
+        _hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        _hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.pat_tree.setColumnWidth(1, 30)
+        self.pat_tree.itemClicked.connect(self._patient_tree_clicked)
+        parent_layout.addWidget(self.pat_tree, 1)
+
+        self.pat_status = QtWidgets.QLabel(
+            "尚未扫描。点「扫描」开始（根目录留空则自动用当前渲染路径）。")
+        self.pat_status.setWordWrap(True)
+        self.pat_status.setStyleSheet("color:#88b0c8; font-size:11px;")
+        parent_layout.addWidget(self.pat_status)
+
+        parent_layout.addStretch(1)
+        self._pat_patients = []
+        self._pat_last_loaded = None
+
+    def _patient_sync_from_render_path(self) -> None:
+        p = self.path_edit.line_edit().text().strip()
+        if p:
+            self.pat_root_edit.line_edit().setText(p)
+            self.pat_status.setText(f"已同步渲染页路径：{p}")
+        else:
+            self.pat_status.setText("渲染页路径为空 —— 请先在「渲染」页填好路径，或点「选文件夹」。")
+
+    def _patient_pick_root(self) -> None:
+        cur = self.pat_root_edit.line_edit().text().strip() or os.getcwd()
+        selected = QtWidgets.QFileDialog.getExistingDirectory(self, "选择病例根目录", cur)
+        if selected:
+            self.pat_root_edit.line_edit().setText(selected)
+
+    def _patient_scan(self) -> None:
+        root = self.pat_root_edit.line_edit().text().strip()
+        if not root:
+            # 根目录留空 -> 直接取渲染页已填路径（这就是选定的默认行为）
+            root = self.path_edit.line_edit().text().strip()
+            if root:
+                self.pat_root_edit.line_edit().setText(root)
+        if not root:
+            self.pat_status.setText("请先指定扫描根目录（或先在「渲染」页填好路径）。")
+            return
+        if not os.path.exists(root):
+            self.pat_status.setText(f"路径不存在：{root}")
+            return
+
+        self.pat_status.setText(f"扫描中… {root}")
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        QtWidgets.QApplication.processEvents()
+        try:
+            from mcp_ssd_vr.dicom import scan_patients
+            res = scan_patients(root)
+        except Exception as exc:  # noqa: BLE001
+            res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+        if not res.get("ok"):
+            self._pat_patients = []
+            self.pat_tree.clear()
+            self.pat_status.setText(f"扫描失败：{res.get('error')}")
+            return
+
+        self._pat_patients = res["patients"]
+        tree = self.pat_tree
+        tree.clear()
+        for p in self._pat_patients:
+            p_it = QtWidgets.QTreeWidgetItem(tree)
+            p_it.setIcon(0, self._pat_icon("patient"))
+            p_it.setIcon(1, self._pat_icon("ok" if p["series"] else "warn"))
+            p_it.setText(0, p["display_name"])
+            p_it.setText(2, p["patient_id"] or "—")
+            p_it.setText(3, p["study_date"] or "—")
+            p_it.setText(4, f"{p['series_count']} 序列")
+            p_it.setText(5, f"{p['size_mb']:g}")
+            p_it.setToolTip(
+                0,
+                f"患者ID: {p['patient_id'] or '—'}\n"
+                f"姓名: {p['patient_name'] or '—'}\n"
+                f"检查日期: {p['study_date'] or '—'}\n"
+                f"模态: {', '.join(p['modalities']) or '—'}\n"
+                f"序列数: {p['series_count']}    总层数: {p['file_count']}")
+            _f = p_it.font(0)
+            _f.setBold(True)
+            p_it.setFont(0, _f)
+            p_it.setForeground(0, QColor("#e8c8d4"))          # 病人行高亮
+            p_it.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"kind": "patient"})
+
+            for s in p["series"]:
+                warn = bool(s["warnings"])
+                s_it = QtWidgets.QTreeWidgetItem(p_it)
+                s_it.setIcon(0, self._pat_icon("series"))
+                s_it.setIcon(1, self._pat_icon("warn" if warn else "ok"))
+                s_it.setIcon(2, self._modality_badge(s["modality"]))
+                s_it.setText(0, s["description"])
+                s_it.setText(2, s["modality"] or "—")
+                s_it.setText(3, s["study_date"] or "")
+                s_it.setText(4, str(s["file_count"]))
+                s_it.setText(5, f"{s['size_mb']:g}")
+                tip = (f"目录: {s['folder']}\n"
+                       f"序列UID: {s['series_uid'] or '—'}\n"
+                       f"层数: {s['file_count']}    大小: {s['size_mb']:g} MB\n"
+                       f"涉及文件夹数: {len(s['folders'])}")
+                if warn:
+                    tip += "\n提示: " + "、".join(s["warnings"])
+                if s.get("split_multi_folder"):
+                    tip += (f"\n注意: 该序列分散在 {len(s['folders'])} 个文件夹，"
+                            f"加载时使用层数最多的：\n  {s.get('load_folder', s['folder'])}")
+                s_it.setToolTip(0, tip)
+                s_it.setData(0, QtCore.Qt.ItemDataRole.UserRole,
+                             {"kind": "series",
+                              "folder": s.get("load_folder") or s["folder"],
+                              "label": f"{p['display_name']} / {s['description']}",
+                              "split": bool(s.get("split_multi_folder"))})
+
+        if len(self._pat_patients) <= 40:
+            tree.expandAll()
+        else:
+            tree.collapseAll()
+        self._pat_last_loaded = None
+        self.pat_status.setText(
+            f"扫描完成：{res['patient_count']} 个病人 / {res['series_count']} 个序列"
+            f"（{res['folder_count']} 个序列目录）。单击一个序列即加载。")
+
+    # ------------------------------------------------------------------
+    # 列表图标
+    # ------------------------------------------------------------------
+    _MODALITY_COLORS = {
+        "CT": "#3f6fa8", "MR": "#7a4fa0", "PT": "#a06a3f", "NM": "#5f8f3f",
+        "US": "#3f8f7a", "CR": "#8f6a3f", "DX": "#8f6a3f", "MG": "#a04f6f",
+        "XA": "#6f3f8f", "RF": "#8f3f4f", "SC": "#5f5f6f", "OT": "#5f5f6f",
+    }
+
+    def _pat_icon(self, kind: str):
+        """类型/状态图标。用 QStyle 标准图标 —— 不依赖 emoji 字体，任何机器都能显示。"""
+        sp = QtWidgets.QStyle.StandardPixmap
+        table = {
+            "patient": sp.SP_DirHomeIcon,
+            "series": sp.SP_FileIcon,
+            "warn": sp.SP_MessageBoxWarning,
+            "ok": sp.SP_DialogApplyButton,
+        }
+        try:
+            return self.style().standardIcon(table.get(kind, sp.SP_FileIcon))
+        except Exception:  # noqa: BLE001
+            return QIcon()
+
+    def _modality_badge(self, modality: str):
+        """模态小色块（QPainter 自绘，同样不依赖字体）。"""
+        text = (modality or "?")[:3].upper()
+        pm = QPixmap(26, 14)
+        pm.fill(QtCore.Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.setBrush(QColor(self._MODALITY_COLORS.get(text, "#5f5f6f")))
+            p.drawRoundedRect(0, 0, 25, 13, 3, 3)
+            p.setPen(QColor("#ffffff"))
+            _f = p.font()
+            _f.setPointSize(7)
+            _f.setBold(True)
+            p.setFont(_f)
+            p.drawText(pm.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, text)
+        finally:
+            p.end()
+        return QIcon(pm)
+
+    def _patient_expand_all(self) -> None:
+        if hasattr(self, "pat_tree"):
+            self.pat_tree.expandAll()
+
+    def _patient_collapse_all(self) -> None:
+        if hasattr(self, "pat_tree"):
+            self.pat_tree.collapseAll()
+
+    # ------------------------------------------------------------------
+    # 单击一个序列 -> 加载
+    # ------------------------------------------------------------------
+    def _patient_tree_clicked(self, item, column) -> None:
+        """单击**序列**行 -> 登记一个加载请求（不当场加载）。
+
+        单击病人行不触发加载（只展开/折叠），避免误触。
+        """
+        data = item.data(0, QtCore.Qt.ItemDataRole.UserRole) or {}
+        if data.get("kind") != "series":
+            return
+        folder = (data.get("folder") or "").strip()
+        if not folder or not os.path.exists(folder):
+            self.pat_status.setText(f"路径不存在：{folder}")
+            return
+        if self._pat_last_loaded == folder and not self.load_busy:
+            self.pat_status.setText("该序列已经加载。")
+            return
+        label = data.get("label") or folder
+        if data.get("split"):
+            label += "（序列分散在多个文件夹，已取层数最多的那个）"
+        self._queue_series_load(folder, label)
+
+    def _queue_series_load(self, folder: str, label: str) -> None:
+        """登记加载请求并去抖——**关键：不在这里直接调用 load_dicom**。
+
+        点击回调有可能是在 build_reader()/set_progress() 的 processEvents()
+        栈深处被派发的。在那里同步发起第二次 load_dicom 会造成嵌套重入：
+        进度条互相覆盖、对话框嵌在别人的渲染栈里，极端情况下直接卡死。
+        这里只登记请求，交给去抖定时器在事件循环里执行；真正加载前还会再查
+        一次 load_busy，忙则走「终止 / 等待」对话框，绝不并发启动第二次加载。
+        """
+        self._pat_pending_request = (folder, label)
+        self.pat_status.setText(f"准备加载：{label} …（连点只会加载最后一个）")
+        self._pat_debounce.start()          # 重启计时：连点只保留最后一次
+
+    def _pat_flush_request(self) -> None:
+        """去抖到期后执行登记好的请求（此时已回到事件循环，栈是干净的）。"""
+        req, self._pat_pending_request = self._pat_pending_request, None
+        if not req:
+            return
+        folder, label = req
+        if not os.path.exists(folder):
+            self.pat_status.setText(f"路径已不存在：{folder}")
+            return
+        if self.load_busy:
+            # 渲染未完成 -> 在顶层弹提示，绝不在这里直接发起第二次加载
+            if self._prompt_render_conflict(folder, label) == "busy_queued":
+                self._pat_last_loaded = folder
+            return
+        self._load_series_stable_cpu(folder, label)
+
+    def _load_series_stable_cpu(self, folder: str, label: str) -> str:
+        """加载一个序列，并强制使用默认的「稳定渲染模式 (CPU/基础)」。
+
+        返回 load_dicom 的状态串：done / invalid / cancelled / error /
+        busy_queued / busy_cancelled。
+
+        交互要点：**渲染期间不切页**——用户仍留在「病人列表」，
+        进度通过 set_progress 镜像到列表底部的提示行。
+        只有渲染成功后才切到「渲染参数」子页去看结果，避免操作过程被反复打断。
+        """
+        self.path_edit.line_edit().setText(folder)
+        # 渲染模式下拉第 0 项 = 「稳定渲染模式 (CPU/基础)」 -> render_mode = "stable"
+        try:
+            self.mode_combo.combo_box().setCurrentIndex(0)
+        except Exception:  # noqa: BLE001
+            pass
+        self._loading_label = label
+        self._pat_last_loaded = folder
+        self.pat_status.setText(f"正在渲染：{label}（稳定渲染模式 CPU/基础）…")
+        QtWidgets.QApplication.processEvents()
+
+        try:
+            status = self.load_dicom()
+        except Exception as exc:  # noqa: BLE001
+            self.pat_status.setText(f"加载失败：{type(exc).__name__}: {exc}")
+            return "error"
+
+        if status == "done":
+            # 渲染完成，这时才把用户带到渲染结果页
+            self.render_stack.setCurrentIndex(1)
+            self.subtab_params.setChecked(True)
+            self.pat_status.setText(f"已加载：{label}　｜　稳定渲染模式 (CPU/基础)")
+        elif status == "cancelled":
+            self._pat_last_loaded = None       # 没渲染成，允许再点
+            self.pat_status.setText("当前渲染已终止。")
+        elif status == "error":
+            self._pat_last_loaded = None
+            self.pat_status.setText(f"渲染失败：{label}")
+        elif status == "invalid":
+            self._pat_last_loaded = None
+            self.pat_status.setText(f"路径无效：{folder}")
+        # busy_* 的状态文本已由 _prompt_render_conflict 写好，这里不覆盖
+        return status
+
+    def _tab_index_by_text(self, needle: str) -> int:
+        """按页签名找下标。
+
+        不要用硬编码下标：往 self.pages 前面插页签会让所有下标整体位移。
+        """
+        for i in range(self.pages.count()):
+            if needle in self.pages.tabText(i):
+                return i
+        return -1
 
     def get_adjusted_points(self, points, wl_offset, ww_scale):
         return [(p[0] * ww_scale + wl_offset,) + p[1:] for p in points]
@@ -3299,6 +3722,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.progress_bar.setValue(value)
         self.progress_text.append(message)
         self._mcp_push("progress", {"percent": value, "message": message})
+        # 渲染期间把进度同时镜像到「病人列表」页的提示行：
+        # 用户点完序列后仍留在列表里，也能看到进度，不必被强行切页。
+        if getattr(self, "load_busy", False) and hasattr(self, "pat_status"):
+            self.pat_status.setText(f"渲染中 {value}% · {message}")
         QtWidgets.QApplication.processEvents()
 
     def _clear_old_volumes(self) -> None:
@@ -3597,21 +4024,93 @@ class ViewerWindow(QtWidgets.QMainWindow):
         vr_prop.SetColor(make_color(adj_vr_co))
         self._configure_vr_property_by_mode(vr_prop)
 
-    def load_dicom(self) -> None:
+    # ==================================================================
+    # 渲染进程保护：上一个序列没渲染完又点了新序列
+    # ==================================================================
+    def _check_load_cancel(self) -> None:
+        """取消检查点。用户选了「终止渲染」就在这里中断 load_dicom。
+
+        检查点放在每个耗时步骤**之后**——那些地方正好是 processEvents 刚跑过、
+        嵌套点击最可能已经进来的位置。
+        """
+        if self.load_cancel:
+            raise _RenderCancelled()
+
+    def _prompt_render_conflict(self, dicom_path: str,
+                                label: str | None = None) -> str:
+        """渲染进行中又来新请求 -> 明确提示，让用户选「终止」还是「等待」。
+
+        返回 "busy_queued"（已排队，稍后自动加载）或 "busy_cancelled"（用户取消）。
+        """
+        pending = label or os.path.basename(os.path.normpath(dicom_path)) or dicom_path
+        # MCP / 自动化模式不弹模态框，保持原来的静默拒绝行为
+        if self._mcp_mode:
+            return "busy_cancelled"
+        if self.load_cancel:
+            return "busy_queued"        # 已经决定终止了，直接排队即可
+
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("正在渲染")
+        box.setText("上一个病例/序列还没有渲染完成。")
+        box.setInformativeText(
+            f"正在渲染：{self._loading_label or '（未知）'}\n"
+            f"新的请求：{pending}\n\n"
+            "· 终止渲染 —— 立刻中断当前渲染，直接加载新序列\n"
+            "· 等待渲染 —— 当前渲染完成后，自动接着加载新序列")
+        btn_abort = box.addButton(
+            "终止渲染", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+        btn_wait = box.addButton(
+            "等待渲染", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("取消", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_wait)          # 默认「等待」，避免误终止
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is btn_abort:
+            self.load_cancel = True
+            self._pending_load = (dicom_path, pending)
+            self.pat_status.setText(f"已请求终止当前渲染，随后加载：{pending}")
+            return "busy_queued"
+        if clicked is btn_wait:
+            self._pending_load = (dicom_path, pending)
+            self.pat_status.setText(f"已排队等待渲染完成，随后加载：{pending}")
+            return "busy_queued"
+        self.pat_status.setText("已取消新请求，继续当前渲染。")
+        return "busy_cancelled"
+
+    def _start_pending_load(self, path: str, label: str) -> None:
+        """执行排队中的下一个序列（由 load_dicom 的 finally 用 singleShot 触发）。"""
+        if not os.path.exists(path):
+            self.pat_status.setText(f"排队的序列路径已不存在：{path}")
+            return
+        self._pat_last_loaded = path
+        self._load_series_stable_cpu(path, label)
+
+    def load_dicom(self) -> str:
+        """加载并渲染 path_edit 里的路径。
+
+        返回状态字符串之一："done" / "invalid" / "busy_queued" / "busy_cancelled"
+        （调用方据此判断是否真的开始加载了）。
+        """
         dicom_path = self.path_edit.line_edit().text().strip()
         if not dicom_path or not os.path.exists(dicom_path):
             self.last_error = "路径无效: " + dicom_path
             self._mcp_push("error", {"error": self.last_error})
             if not self._mcp_mode:
                 QtWidgets.QMessageBox.warning(self, "路径无效", "请输入有效的 DICOM 路径。")
-            return
+            return "invalid"
 
         if self.load_busy:
+            # 上一个病例/序列还没渲染完 -> 明确提示，让用户决定「终止」还是「等待」
             self.last_error = "load in progress: busy"
             self._mcp_push("error", {"error": self.last_error, "load_busy": True})
-            return
+            return self._prompt_render_conflict(dicom_path)
 
         self.load_busy = True
+        self.load_cancel = False
+        self._loading_label = self._loading_label or os.path.basename(
+            os.path.normpath(dicom_path))
         self._mcp_push("load_start", {"path": dicom_path})
         self._clear_old_volumes()
         self.btn_load.setEnabled(False)
@@ -3626,6 +4125,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 import sys; sys.stdout.flush()
             image_data, downsample_msg = build_reader(dicom_path, self.denoise_method, self.use_clahe, self.use_frangi, self.use_distance_field, self.use_2d_tf, self.use_2d_tf_bone, self.vram_threshold_gb, self.cpu_render)
             self.set_progress(35, "DICOM 数据读取完成。")
+            self._check_load_cancel()
             if downsample_msg:
                 self.set_progress(40, downsample_msg)
 
@@ -3639,6 +4139,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.vr_work_array = self.vr_base_array.copy()
             self._refresh_vr_scalar_binding()
             self.set_progress(45, f"体数据尺寸: {dims[0]} x {dims[1]} x {dims[2]}")
+            self._check_load_cancel()
 
             try:
                 if os.path.isdir(dicom_path):
@@ -3798,6 +4299,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 self.set_progress(65, "CR 路径追踪渲染器已就绪（混合散射）。")
             else:
                 self.set_progress(65, f"采用 GPU 混合模式：已启用 vtkGPUVolumeRayCastMapper (显存限额 {self.vram_threshold_gb}GB)。")
+            self._check_load_cancel()
 
             ssd_prop = vtk.vtkVolumeProperty()
             ssd_prop.SetColor(make_color(self.ssd_color_points))
@@ -3932,6 +4434,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
             cam.SetViewUp(0, 0, 1)
             self.renderer.ResetCameraClippingRange()
             self._apply_cr_runtime_params()
+            # 最后一次重渲染前再确认一次：这一步最耗时，用户很可能就是在这里点了新序列
+            self._check_load_cancel()
             self.render_window.Render()
             self.set_progress(100, "渲染完成。可交互浏览。")
 
@@ -3946,6 +4450,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
             })
             # 3D SAM：新数据到来时重置点/结果并同步切片范围
             self._sam_reset()
+        except _RenderCancelled:
+            # 用户在"正在渲染"对话框里选择了「终止渲染」
+            self.set_progress(0, "当前渲染已终止。")
+            self._mcp_push("error", {"error": "render_cancelled", "path": dicom_path})
+            status = "cancelled"
         except Exception as exc:
             import traceback
             traceback.print_exc()
@@ -3954,10 +4463,22 @@ class ViewerWindow(QtWidgets.QMainWindow):
             if not self._mcp_mode:
                 QtWidgets.QMessageBox.critical(self, "加载失败", f"DICOM 加载或渲染失败：\n{exc}")
             self.set_progress(0, "加载失败。")
+            status = "error"
+        else:
+            status = "done"
         finally:
             self.load_busy = False
+            self.load_cancel = False
+            self._loading_label = ""
             self.btn_load.setEnabled(True)
             QtWidgets.QApplication.restoreOverrideCursor()
+            # 有排队的请求就接着加载。
+            # 用 singleShot(0) 让当前调用先完整退栈，避免 load_dicom 递归。
+            _pend, self._pending_load = self._pending_load, None
+            if _pend is not None:
+                QtCore.QTimer.singleShot(
+                    0, lambda p=_pend[0], l=_pend[1]: self._start_pending_load(p, l))
+        return status
 
     def _scan_weight_dir(self, path):
         import re
@@ -5275,10 +5796,28 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
 
 def main() -> int:
+    # --- 标准流编码兜底（Windows Server 等英文系统上必须）----------------
+    # --noconsole 打包时 PyInstaller 会把 sys.stdout/stderr 置为 None，
+    # 原来的兜底是 open(os.devnull, "w")——**没指定编码**，于是用系统 ANSI
+    # 代码页：中文 Windows 是 cp936（能编中文，本机看不出问题），
+    # 但英文版 Windows Server 是 cp1252，一 print 中文就抛
+    #   UnicodeEncodeError: 'charmap' codec can't encode characters ...
+    # 而 build_reader 里有几十条中文 print，且异常会被 load_dicom 的
+    # except 抓成 "DICOM 加载或渲染失败"——表现为"渲染直接失败"，
+    # 实际只是日志写不出去。
+    # 兜底策略：devnull 明确用 utf-8 + errors="replace"（反正输出是被丢掉的）；
+    # 真实流只放宽 errors、**不改编码**，避免中文控制台出现乱码。
     if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w")
+        sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
     if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w")
+        sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
+    for _stream_name in ("stdout", "stderr"):
+        _stream = getattr(sys, _stream_name, None)
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(errors="replace")
+            except Exception:  # noqa: BLE001
+                pass
 
     if sys.platform == "darwin" and getattr(sys, "frozen", False):
         res_dir = os.path.join(os.path.dirname(sys.executable), "..", "Resources")
@@ -5328,7 +5867,12 @@ def main() -> int:
 
     if os.path.isdir(initial) or os.path.isfile(initial):
         QtCore.QTimer.singleShot(400, win.load_dicom)
-        QtCore.QTimer.singleShot(5000, lambda: win.pages.setCurrentIndex(1))
+        # 按页签名查找，不要硬编码下标：左侧栏最前面新增了「病人列表」，
+        # 原来的 setCurrentIndex(1) 会从「自动ROI检测」错位到「渲染」。
+        QtCore.QTimer.singleShot(
+            5000,
+            lambda: win.pages.setCurrentIndex(
+                win._tab_index_by_text("自动ROI检测")))
 
     return app.exec()
 
