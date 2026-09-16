@@ -241,6 +241,25 @@ ssdvr_status()                      # 未连接时也会告诉你"打算启动�
 | 单元 `temp/patient_probe/test_exe_bridge.py` | **PASS 63/63**（发现文件、协议握手、EXE 查找、命令行拼装、默认开关） |
 | 既有 8 个回归套件 | 全部 PASS |
 
+### 8.1 CI 新构建产物实测（2026-09-17 06:14 构建，commit `1d7db0f8`）
+
+FULL 构建 `35105037096` 全绿（26 min，DLL 依赖检查/VC+OpenMP 门禁均通过），
+产物直接解到 `SSD_VR_Fusion_Viewer_Full_Win\` 后：
+
+| 验证 | 结果 |
+|---|---|
+| `temp/mcp_exe_probe/test_shipped_exe_port.py`（对**已下载的交付 EXE**） | **PASS 29/29** |
+| 不带任何参数启动（双击等价） | 3.0 s 写出发现文件，端口默认 7799，`frozen:true`，`exe` 指向自身 |
+| 发现文件 host | 仅 `127.0.0.1`（不监听外网） |
+| 裸 TCP + 手写 JSON（不依赖本项目代码） | `{"id":"raw-1","ok":true,...}` 正常往返 |
+| agent 侧自动发现 | `discover_port()` / `get_client()` 无需预设端口即接管 |
+| 操作类 | `query_state` / `get_thresholds`（ssd `[320,1300]`、vr `[20,150]`）/ `list_presets` / `get_render_params` 全部可用 |
+| 加载 + 渲染 | `load_dicom` → `load_done` → dims `256×256×80`；`set_mode` / `set_opacity` / `set_camera` 生效 |
+| 截图 | stable 439 色 → cinematic 117570 色（与 GUI 同步、肉眼可核对） |
+| `--no-mcp` | 无发现文件、扫描不到桥、纯 GUI |
+| 一次性 Windows 构建 `35105037116`（onefile 644 MB） | 同样 17/17 通过（默认开桥 20.4 s，渲染 587 色） |
+| macOS 构建 `35105037035` | 8m22s success |
+
 ---
 
 ## 9. 相关文件
