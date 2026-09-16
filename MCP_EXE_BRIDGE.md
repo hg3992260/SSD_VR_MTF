@@ -177,6 +177,101 @@ set_window_level, set_ssd_threshold, set_vr_threshold, get_thresholds, set_cr_pa
 set_crop, toggle_background, get_render_params, apply_preset, list_presets, trigger_roi, roi_cancel,
 roi_clear, list_roi_blocks, render_roi_label, set_custom_roi, set_roi_weight_path`。
 
+### 4.5 其他 agent 怎么操作这个程序（三条路，按省事程度排序）
+
+| 路线 | 适用 | agent 要做什么 | 实测 |
+|---|---|---|---|
+| **A. 标准 MCP 客户端** | Claude Code/Desktop、Cursor、Cline、Continue、DSH、opencode… | 只写一段配置（§4.1–4.3），重启客户端 | **PASS 19/19**（手写 JSON-RPC 握手 → `tools/list` 36 个工具 → `tools/call` 打到 GUI） |
+| **B. 现成脚本** | 只能执行 shell 的 agent、临时排查、自动化脚本 | `python tools/ssdvr_agent_client.py call set_mode mode=cinematic` | 通过（`discover/call/wait/shot` 全通） |
+| **C. 自己写 20 行** | 别的语言、嵌入式、想自己控制重试 | 照 §4.6 抄一段，或把 `mcp_ssd_vr/bridge_registry.py` 一起 vendor | Python / Node / PowerShell 三种都实测通过 |
+
+三者操作的是**同一个正在运行的 GUI**：端口由发现文件 + 协议握手确定，agent 不需要知道端口。
+
+### 4.6 各语言最小客户端（都实测过）
+
+**Python（纯标准库）**
+
+```python
+import json, os, socket
+reg = os.path.join(os.environ.get("LOCALAPPDATA", ""), "SSD_VR_MCP", "bridge.json")
+port = json.load(open(reg, encoding="utf-8"))["port"]        # 或直接试 7799
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+s.sendall(json.dumps({"id": "1", "op": "set_camera",
+                      "args": {"azimuth": 45, "elevation": 12}}).encode() + b"\n")
+while True:                                                   # 事件行没有 id，跳过
+    msg = json.loads(s.recv(65536).decode("utf-8").split("\n")[0])
+    if msg.get("id") == "1":
+        print(msg); break
+```
+
+**Node（无依赖）**：完整可复制版见 `tools/ssdvr_agent_client.js`
+
+```js
+const net=require("net"),fs=require("fs"),path=require("path");
+const port=JSON.parse(fs.readFileSync(path.join(process.env.LOCALAPPDATA,"SSD_VR_MCP","bridge.json"),"utf8")).port;
+const s=net.connect(port,"127.0.0.1",()=>s.write(JSON.stringify({id:"1",op:"query_state",args:{}})+"\n"));
+s.on("data",d=>{process.stdout.write(d);s.end();});
+```
+
+**PowerShell（无依赖）**：完整可复制版见 `tools/ssdvr_agent_client.ps1`
+
+```powershell
+$port = [int](Get-Content "$env:LOCALAPPDATA\SSD_VR_MCP\bridge.json" -Raw | ConvertFrom-Json).port
+$c = New-Object System.Net.Sockets.TcpClient('127.0.0.1', $port); $st = $c.GetStream()
+$b = [Text.Encoding]::UTF8.GetBytes('{"id":"1","op":"query_state","args":{}}' + "`n")
+$st.Write($b, 0, $b.Length); $st.Flush()
+$buf = [byte[]]::new(65536); $n = $st.Read($buf, 0, $buf.Length)
+[Text.Encoding]::UTF8.GetString($buf, 0, $n); $c.Close()
+```
+
+> ⚠️ **PowerShell 5.1 编码坑（踩过）**：BOM-less 的 `.ps1` 被当成 ANSI（中文系统 = cp936）读取，
+> 中文注释的字节会把**下一行代码吃掉**，表现为"变量莫名是 `$null` / 方法调用报 null"。
+> 最小客户端脚本请保持**纯 ASCII**，或存成 **UTF-8 with BOM**。
+
+### 4.7 参数怎么传（跨 shell 不被引号吃掉）
+
+```bash
+python tools/ssdvr_agent_client.py call set_mode mode=cinematic
+python tools/ssdvr_agent_client.py call set_camera azimuth=45 elevation=12 dolly=1.2
+python tools/ssdvr_agent_client.py call load_dicom path=D:\case\series
+python tools/ssdvr_agent_client.py call set_camera '{"azimuth":45,"elevation":12}'   # JSON 也行
+```
+
+`key=value` 简写会自动转型（`45`→int、`1.2`→float、`true`→bool、`[1,2]`→list）；
+**值里带空格时必须用完整 JSON**（PowerShell/cmd 会把 JSON 里的双引号吃掉，简写就是为了绕开这点）。
+
+### 4.8 异步事件（长任务必须等）
+
+`load_dicom` / `trigger_roi` 是**异步**的：桥先把命令投给 Qt 主线程，然后推事件：
+
+```
+load_start → progress{percent,message} × N → load_done        # 加载并渲染完
+roi_done{...}                                                  # 语义分割完（1-5 分钟）
+error{error}                                                   # 失败
+```
+
+- 走 MCP：`ssdvr_wait_event(etype="load_done")`
+- 走脚本：`python tools/ssdvr_agent_client.py wait load_done 300`
+- 自己写：循环读行，`{"type":...}` 是事件、`{"id":...}` 是响应（§4.6 的循环已经这么做了）
+
+### 4.9 别的机器上的 agent
+
+桥只绑 `127.0.0.1`，跨机用 SSH 隧道（把远端 7799 映到本地）：
+
+```bash
+ssh -N -L 7799:127.0.0.1:7799 user@渲染机
+# 然后本地 agent 照常连 127.0.0.1:7799（发现文件不存在时扫描默认段即可）
+```
+
+或者干脆**在渲染机上跑 MCP server**（`mcp_ssd_vr/server.py` 在哪台机器都行，它只是客户端），
+客户端用 SSH 把 stdio 转过去。
+
+### 4.10 谁先谁后
+
+1. GUI 必须先起来（双击 EXE，或让 agent 调 `ssdvr_launch`）
+2. 任何 agent 都能随后接管；**同一时刻只让一个 agent 操作**（见 §6）
+3. agent 挂了/GUI 重启都不影响对方：桥是独立进程内的独立线程，靠发现文件重新握手即可
+
 ---
 
 ## 5. `ssdvr_launch` 的启动目标
@@ -274,3 +369,6 @@ FULL 构建 `35105037096` 全绿（26 min，DLL 依赖检查/VC+OpenMP 门禁均
 | `mcp_ssd_vr/tools/inspect.py` | `ssdvr_status` 暴露 discovery / launch 诊断信息 |
 | `ssd_vr_viewer.py` `main()` | `--mcp` 默认开、`--no-mcp` 关、`--mcp-port` 认 `SSD_VR_MCP_PORT` |
 | `.github/workflows/main-full.yml` `main.yml` | `--add-data=mcp_ssd_vr;mcp_ssd_vr` + `--hidden-import=mcp_ssd_vr.bridge_registry` |
+| `tools/ssdvr_agent_client.py` | 现成命令行客户端（纯标准库）：`discover` / `ops` / `call` / `wait` / `shot` |
+| `tools/ssdvr_agent_client.js` | 同上，Node 版（无依赖），给 JS agent 抄 |
+| `tools/ssdvr_agent_client.ps1` | 同上，PowerShell 版（**纯 ASCII**，见 §4.6 的编码坑） |
