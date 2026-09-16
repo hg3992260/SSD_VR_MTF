@@ -2062,6 +2062,45 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.render_window.SetNumberOfLayers(3)
         self.pages.currentChanged.connect(self._on_tab_changed)
 
+        # --- 署名 / 版权：常驻状态栏右侧（强调色徽章，要求"显眼"）---------
+        # 用 PyCt6 的 CLabel（遵循 master= 与 (浅色, 深色) 双色元组约定）；
+        # 圆角 + 描边 + 半透明底由 CLabel 自身的 border_width/corner_radius/
+        # background_color 参数生成，不手写样式表。
+        # 放状态栏的理由：
+        #   1) 主界面任何时候都可见，又不占用参数区/渲染区；
+        #   2) addPermanentWidget 不会被 showMessage() 的临时提示顶掉；
+        #   3) 截图（含 MCP 的 ssdvr_screenshot）会把它一起带出去。
+        #
+        # 字号/字重必须单独覆盖：dark.qss 里有全局
+        #   QLabel { font-weight: 600; font-size: 9pt; }
+        # 会把所有 QLabel 统一成 9pt 半粗，署名要更显眼就得加点力度。
+        # 覆盖方式用「追加规则」而不是 setStyleSheet 整体替换 ——
+        # 后者会丢掉 CLabel 按主题算出来的颜色。
+        _CREDIT_TEXT = "designed by christ.paul90@gmail.com, all rights reserved"
+        self.credit_label = CLabel(
+            master=self,
+            width=420,
+            height=16,
+            text=_CREDIT_TEXT,
+            font_size=11,                                  # 渲染时会被下面的规则覆盖为 11pt
+            text_color=("#8a2440", "#ffc2d4"),             # (浅色模式, 深色模式) 高对比
+            background_color=("rgba(200,96,112,0.10)", "rgba(224,112,144,0.18)"),
+            border_color=("rgba(200,96,112,0.55)", "rgba(224,112,144,0.65)"),
+            border_width=1,
+            corner_radius=9,                               # 胶囊形
+            tooltip=_CREDIT_TEXT,
+        )
+        _credit_lbl = self.credit_label.label()
+        # 字号/字重提权：dark.qss 里全局 QLabel{font-weight:600;font-size:9pt}
+        # 会把署名压成普通小字。字体规则写在 dark.qss 的 QLabel#creditLabel 里，
+        # **不能**在这里 setStyleSheet 追加 —— CLabel._change_theme() 在
+        # 调色板/主题变化时会重写它自己的整个样式表，追加的规则会被抹掉
+        # （实测确实被抹掉了）。这里只负责挂对象名 + 立刻重新 polish。
+        _credit_lbl.setObjectName("creditLabel")
+        _credit_lbl.style().unpolish(_credit_lbl)
+        _credit_lbl.style().polish(_credit_lbl)
+        self.statusBar().addPermanentWidget(self.credit_label)
+
     def _kedge_tab_index(self):
         for i in range(self.pages.count()):
             if "K-edge" in self.pages.tabText(i):

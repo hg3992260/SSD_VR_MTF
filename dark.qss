@@ -243,6 +243,16 @@ QLabel {
     font-weight: 600;
 }
 
+/* 署名徽章（状态栏右侧）—— 要求"显眼"，所以单独提权放大加粗。
+   放在这里而不是 Python 里 setStyleSheet 追加：CLabel._change_theme() 在
+   调色板/主题变化时会重写它自己的整个样式表，追加的规则会被抹掉（实测被抹掉）。
+   CLabel 自带的样式表只设置 color / background / border，**不设字体**，
+   因此这里的字体规则和它不冲突，且不会被重写。 */
+QLabel#creditLabel {
+    font-weight: bold;
+    font-size: 11pt;
+}
+
 QComboBox {
     background: #1c0a12;
     color: #e6d4da;
