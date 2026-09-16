@@ -5927,9 +5927,21 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="PySide6 SSD+VR DICOM viewer (Figure 8 style fusion).")
     parser.add_argument("--input", default="", help="DICOM folder path or a single DICOM file")
-    parser.add_argument("--mcp", action="store_true", help="启动 MCP 桥（TCP），供 opencode MCP server 调用")
-    parser.add_argument("--mcp-port", type=int, default=7799, help="MCP 桥端口")
+    # 桥默认开启：冻结版 EXE 双击即暴露 127.0.0.1 控制口，任何 MCP 客户端
+    # （DSH / opencode / Claude Desktop / 自写脚本）都能直接接管，无需改快捷方式。
+    # 只需要 GUI、不希望被外部控制时加 --no-mcp（或设 SSD_VR_MCP=0）。
+    parser.add_argument("--mcp", dest="mcp", action="store_true", default=None,
+                        help="启动 MCP 桥（TCP，默认开启；仅为兼容旧命令保留）")
+    parser.add_argument("--no-mcp", dest="mcp", action="store_false",
+                        help="不启动 MCP 桥（纯 GUI 模式）")
+    parser.add_argument("--mcp-port", type=int,
+                        default=int(os.environ.get("SSD_VR_MCP_PORT") or 7799),
+                        help="MCP 桥端口（被占时自动向后探测；默认取 SSD_VR_MCP_PORT，否则 7799）")
     args = parser.parse_args()
+
+    if args.mcp is None:
+        _env_mcp = (os.environ.get("SSD_VR_MCP") or "").strip().lower()
+        args.mcp = _env_mcp not in ("0", "false", "off", "no")
 
     local_weights = os.path.join(_external_dir(), "totalseg_weights")
     if os.path.isdir(local_weights):
@@ -5955,8 +5967,11 @@ def main() -> int:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         try:
             from mcp_ssd_vr.gui_bridge import start_bridge
-            start_bridge(win, args.mcp_port)
-            print(f"[MCP bridge] listening on 127.0.0.1:{args.mcp_port}", flush=True)
+            _bridge = start_bridge(win, args.mcp_port)
+            # 打印**实际**端口：请求端口被占用时桥会自动向后探测，
+            # 客户端可用发现文件（%LOCALAPPDATA%\SSD_VR_MCP\bridge.json）拿到它。
+            print(f"[MCP bridge] listening on 127.0.0.1:{_bridge.port} "
+                  f"(pid={os.getpid()}, frozen={getattr(sys, 'frozen', False)})", flush=True)
         except Exception as _e:
             print(f"[MCP bridge] failed to start: {_e}", flush=True)
 

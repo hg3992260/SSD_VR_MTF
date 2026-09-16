@@ -10,13 +10,29 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import socket
+import sys
 import threading
 import time
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
+
+try:  # 发现文件（跨进程定位实际端口）；缺失时降级为"不发布"
+    from mcp_ssd_vr import bridge_registry as registry
+except Exception:  # noqa: BLE001
+    class _NoRegistry:  # type: ignore[no-redef]
+        @staticmethod
+        def write_bridge_file(*_a, **_k):
+            return ""
+
+        @staticmethod
+        def remove_bridge_file(*_a, **_k):
+            return None
+
+    registry = _NoRegistry()  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -784,23 +800,61 @@ class GuiBridgeServer:
         self._clients_lock = threading.Lock()
         self._closing = threading.Event()
 
+    # -- 绑定 / 发布 ------------------------------------------------------
+
+    def _bind(self) -> bool:
+        """同步绑定端口；被占用则向后探测。返回是否绑定成功。"""
+        while self._running.is_set():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((self.host, self.port))
+                sock.listen(1)
+                sock.settimeout(1.0)
+            except OSError:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                if self.port >= 7899:
+                    return False
+                self.port += 1
+                continue
+            self._sock = sock
+            return True
+        return False
+
+    def _publish(self) -> None:
+        """把**实际**端口写进发现文件并广播 gui_ready。
+
+        只有绑定成功之后才能知道真实端口（被占用时会向后递增），
+        所以这里必须在 _bind() 之后调用——否则客户端拿到的是请求端口。
+        """
+        try:
+            registry.write_bridge_file(
+                self.port, host=self.host,
+                mode="mcp",
+                frozen=bool(getattr(sys, "frozen", False)),
+                exe=os.path.abspath(sys.executable),
+            )
+        except Exception:
+            pass  # 发现文件只是便利手段，失败不影响桥本身
+        self.push_event("gui_ready", {"port": self.port, "host": self.host})
+
     def start(self) -> None:
         self._running.set()
+        if not self._bind():
+            raise RuntimeError(f"cannot bind mcp bridge on {self.host}:{self.port}")
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
-        self.push_event("gui_ready", {"port": self.port})
+        self._publish()
 
     def _serve(self) -> None:
         while self._running.is_set():
-            try:
-                self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self._sock.bind((self.host, self.port))
-                self._sock.listen(1)
-                self._sock.settimeout(1.0)
-            except OSError:
-                self.port += 1
-                continue
+            if self._sock is None:
+                if not self._bind():
+                    break
+                self._publish()
             while self._running.is_set():
                 try:
                     conn, _ = self._sock.accept()
@@ -883,10 +937,21 @@ class GuiBridgeServer:
                 self._sock.close()
             except OSError:
                 pass
+        try:
+            registry.remove_bridge_file(self.port)
+        except Exception:
+            pass
 
 
 def start_bridge(win, port: int) -> GuiBridgeServer:
     bridge = GuiBridgeServer(win, port=port)
     win._mcp_bridge = bridge
     bridge.start()
+    # 退出时清掉发现文件，避免下次启动读到过期的端口
+    app = QtWidgets.QApplication.instance()
+    if app is not None:
+        try:
+            app.aboutToQuit.connect(bridge.stop)
+        except Exception:
+            pass
     return bridge

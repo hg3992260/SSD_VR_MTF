@@ -63,6 +63,15 @@ ssd_vr_viewer.py（GUI 进程，独立生命周期）
 | `SSD_VR_PYTHON` | `/Users/cuiqi/Desktop/python/conda/envs/dicom/bin/python` | GUI 解释器（必须含 vtk/PySide6/SimpleITK/totalsegmentator） |
 | `SSD_VR_REPO` | 仓库根目录 | 覆盖项目根 |
 | `SSD_VR_MCP_PORT` | `7799` | 桥端口，被占时自动向后探测（7799–7899） |
+| `SSD_VR_EXE` | 自动发现 | 冻结版 EXE 路径（也可给包含 exe 的目录） |
+| `SSD_VR_LAUNCH` | `auto` | 启动目标：`auto`（有 EXE 用 EXE）/ `source` / `exe` |
+| `SSD_VR_BRIDGE_FILE` | `%LOCALAPPDATA%\SSD_VR_MCP\bridge.json` | 桥"发现文件"路径 |
+
+### 3.3 接入冻结版 EXE / 被别的 agent 接管
+
+桥已编进 EXE，**默认开启**；MCP server 端会自动发现端口（发现文件 + 协议握手 + 7799–7898 扫描），
+所以"用户双击 EXE、agent 直接接管"无需任何配置。完整说明、各客户端配置片段、
+安全边界与排查表见 **`MCP_EXE_BRIDGE.md`**。
 
 ### 3.2 标准工作流（多序列病例）
 
@@ -89,11 +98,15 @@ ssd_vr_viewer.py（GUI 进程，独立生命周期）
 **`ssdvr_launch(dicom_path=None)`**
 - 启动 GUI 进程并等待 TCP 桥就绪。`dicom_path` 可指定启动即加载的 DICOM；**省略 = 干净启动**（不再有默认测试数据）。
 - 内部会先做 `resolve_series_path`（病例根目录 → 单一序列文件夹）。
-- 返回 `{ok, pid, port, log}`；若已运行返回 `already_connected/already_running`。
+- **启动目标自动选择**：默认 `auto` = 仓库里有冻结版 EXE 就启动 EXE，否则回退源码。
+  `SSD_VR_LAUNCH=source` 强制源码（调试用），`exe` 强制 EXE（找不到直接报错），
+  `SSD_VR_EXE` 可显式指定 exe 或目录。详见 **`MCP_EXE_BRIDGE.md`**。
+- 返回 `{ok, pid, port, target, exe}`；若已运行（含用户手工双击的 EXE）返回 `already_connected/attached`，不重复启动。
 
 **`ssdvr_restart_gui()`**
-- 重启 GUI 进程（viewer/`gui_bridge.py` 改动后调用生效）。返回 `{ok, pid, port, old_pid, reconnected}`。
+- 重启 GUI 进程（viewer/`gui_bridge.py` 改动后调用生效）。返回 `{ok, pid, port, old_pid, target, reconnected}`。
 - **会先安全关闭旧进程**（`shutdown` → 等待退出 → terminate → kill），再启动新进程，避免进程残留占端口（旧版本曾因此连回旧代码进程）。
+- 当前实例是"接管"来的手工进程时，同样先通过桥 `shutdown` 再重启。
 - 桥自动重连；调用返回时 `reconnected:true` 即可用。
 
 **`ssdvr_reload_tools()`**

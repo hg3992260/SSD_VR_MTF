@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from typing import Optional
 
+from .. import bridge_registry as registry
+from .. import config
 from ..context import get_ctx
 from ._util import call, get_client
 
@@ -13,7 +15,11 @@ TOOL_META = {"name": "ssdvr_inspect", "version": "1.0"}
 def register(mcp) -> None:
     @mcp.tool()
     def ssdvr_status() -> dict:
-        """健康检查：bridge_connected/port/gui_state/last_error/record_session。"""
+        """健康检查：bridge_connected/port/gui_state/last_error/record_session/启动目标。
+
+        未连接时返回的 discovery 字段说明在哪里找过桥（发现文件路径 + 扫描范围），
+        便于判断"GUI 没开"还是"GUI 用了 --no-mcp"。
+        """
         ctx = get_ctx()
         client = get_client(auto_connect=True)
         connected = bool(client is not None and client.connected)
@@ -22,6 +28,7 @@ def register(mcp) -> None:
             ok, data = call("query_state", {}, timeout=5.0, tool_name="ssdvr_status")
             if ok:
                 gui_state = data
+        target, path = config.resolve_launch_target()
         return {
             "ok": True,
             "bridge_connected": connected,
@@ -30,6 +37,11 @@ def register(mcp) -> None:
             "gui_state": gui_state,
             "last_error": ctx.last_error,
             "record_session": getattr(ctx.recorder, "_jsonl_path", None) if ctx.recorder else None,
+            "launch": {"target": target, "path": path,
+                       "preference": config.launch_preference(),
+                       "exe_found": bool(config.gui_exe())},
+            "discovery": registry.registry_info(),
+            "scan_range": [config.default_port(), config.default_port() + 99],
         }
 
     @mcp.tool()
