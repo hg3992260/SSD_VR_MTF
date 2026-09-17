@@ -304,8 +304,33 @@ def _deps_via_otool(src):
     return deps
 
 
-def _dep_closure(binaries, lib_dirs, dep_reader=_deps_via_otool):
-    """补入缺失的 soname 名字。返回 (added, still_missing)。可注入 dep_reader 便于单测。"""
+_SONAME_STAGE = Path('build_sonames')
+_SONAME_STAGE.mkdir(exist_ok=True)
+
+
+def _stage_soname(name, src):
+    """把 symlink 目标实体化成**以 soname 命名**的真实文件，返回其路径。
+
+    为什么必须这么做：PyInstaller 收集二进制时会解析 symlink，并按**源文件名**决定
+    目标名。直接把 conda 的 symlink（libicuuc.78.dylib -> libicuuc.78.3.dylib）塞进
+    TOC，最终包里只会出现 libicuuc.78.3.dylib —— 而 Qt 的 install name 要的是
+    @rpath/libicuuc.78.dylib，于是"CI 能跑、用户机器崩"。
+    先 hardlink（同盘零拷贝）/copy 成一个真名叫 soname 的实体文件，就能保住名字。
+    """
+    dst = _SONAME_STAGE / name
+    if dst.exists():
+        return str(dst)
+    real = os.path.realpath(src)
+    try:
+        os.link(real, dst)          # 同文件系统：硬链接，不额外占空间
+    except OSError:
+        import shutil
+        shutil.copy2(real, dst)
+    return str(dst)
+
+
+def _dep_closure(binaries, lib_dirs, dep_reader=_deps_via_otool, stager=_stage_soname):
+    """补入缺失的 soname 名字。返回 (added, still_missing)。可注入依赖读取器/实体化器便于单测。"""
     have = {os.path.basename(str(e[0]).replace('\\', '/')) for e in binaries}
     added, missing = [], []
     for dest, src, _typ in list(binaries):
@@ -323,7 +348,7 @@ def _dep_closure(binaries, lib_dirs, dep_reader=_deps_via_otool):
             for d in lib_dirs:
                 cand = os.path.join(str(d), name)
                 if os.path.isfile(cand) or os.path.islink(cand):
-                    binaries.append((name, cand, 'BINARY'))
+                    binaries.append((name, stager(name, cand), 'BINARY'))
                     have.add(name)
                     added.append(name)
                     placed = True
