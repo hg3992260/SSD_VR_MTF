@@ -54,41 +54,45 @@ fi
 head "3. Qt 只能有一套（conda 裸 dylib / pip wheel）"
 # conda 风格：libQt6*.dylib 不在 /PySide6/Qt/ 下（通常落在 Contents/Frameworks 根）
 NAKED_ROOT=$(find "$APP" -name 'libQt6*.dylib' -type f -not -path '*/PySide6/Qt/*' 2>/dev/null | wc -l | tr -d ' ')
-# pip wheel 风格 a：PySide6/Qt/lib 下的 libQt6*.dylib（常带补丁号 .6.11.2）
 WHEEL_LIBS=$(find "$APP" -path '*/PySide6/Qt/lib/*' -name 'libQt6*.dylib' -type f 2>/dev/null | wc -l | tr -d ' ')
-# pip wheel 风格 b：PySide6/Qt/lib 下的 Qt*.framework
 WHEEL_FW=$(find "$APP" -path '*/PySide6/Qt/lib/*' -name 'Qt*.framework' -type d 2>/dev/null | wc -l | tr -d ' ')
-# 兜底：任何位置的 Qt framework
+# 兜底：任何位置的 Qt framework（pip wheel 的确定特征：conda-forge 的 pyside6
+# 实测 framework 数为 0，所以"有 framework"就等于混进了 wheel 版 Qt）
 ANY_FW=$(find "$APP" -name 'Qt*.framework' -type d 2>/dev/null | wc -l | tr -d ' ')
 info "conda 风格 libQt6*.dylib : $NAKED_ROOT"
-info "wheel 风格 libQt6*.dylib : $WHEEL_LIBS"
-info "wheel 风格 Qt*.framework : $WHEEL_FW (任意位置 $ANY_FW)"
+info "PySide6/Qt/lib 下 dylib  : $WHEEL_LIBS"
+info "PySide6/Qt/lib 下 fw     : $WHEEL_FW"
+info "任意位置 Qt*.framework   : $ANY_FW"
 
-FAMILIES=0
-[ "$NAKED_ROOT" -gt 0 ] && FAMILIES=$((FAMILIES + 1))
-if [ "$WHEEL_LIBS" -gt 0 ] || [ "$WHEEL_FW" -gt 0 ]; then
-  FAMILIES=$((FAMILIES + 1))
-fi
-if [ "$FAMILIES" -gt 1 ]; then
-  bad "检测到 $FAMILIES 套 Qt 发行版同时入包 —— 这正是第二次崩溃（EXC_BAD_ACCESS）的原因"
+if [ "$NAKED_ROOT" -eq 0 ]; then
+  bad "找不到 Qt 库（打包肯定不完整）"
+elif [ "$ANY_FW" -gt 0 ] && [ "${ALLOW_WHEEL_QT:-0}" != "1" ]; then
+  bad "包里存在 Qt*.framework（$ANY_FW 个）——这是 pip wheel 版 Qt 的特征，"
+  bad "  与 conda 的裸 dylib Qt 混装会导致 ObjC 类重复注册（第二次崩溃的原因）"
+  find "$APP" -name 'Qt*.framework' -type d 2>/dev/null | head -5 | sed 's/^/         /'
   bad "  修法见 .github/workflows/macos.yml：conda 装 vtk + pyside6，"
   bad "  PyCt6 用 pip install --no-deps，绝不要再 pip install PySide6"
-elif [ "$FAMILIES" -eq 0 ]; then
-  bad "找不到任何 Qt 库 —— 打包肯定不完整"
 else
-  ok "只有一套 Qt（conda=$NAKED_ROOT, wheel_libs=$WHEEL_LIBS, wheel_fw=$WHEEL_FW）"
+  ok "只有一套 Qt（裸 dylib $NAKED_ROOT 个，无 framework）"
 fi
 
-if [ "$ANY_FW" -gt 0 ] && [ "${ALLOW_WHEEL_QT:-0}" != "1" ]; then
-  bad "包里存在 Qt*.framework（$ANY_FW 个）—— CI 统一用 conda-forge 的 pyside6 时不应出现"
-  find "$APP" -name 'Qt*.framework' -type d 2>/dev/null | head -5 | sed 's/^/         /'
-fi
-
-# 同一个 basename 落在两个路径 = 同一份 Qt 装了两遍
-DUPES=$(find "$APP" -name 'libQt6*.dylib' -type f 2>/dev/null -exec basename {} \; | sort | uniq -d | head -n 5)
+# 同名 Qt 库出现在多处：内容不同 = 两套 Qt（致命）；内容相同 = 同一份被复制（提示）
+DUPES=$(find "$APP" -name 'libQt6*.dylib' -type f 2>/dev/null -exec basename {} \; | sort | uniq -d)
 if [ -n "$DUPES" ]; then
-  bad "以下 Qt 库同名多份（同一个 Qt 被装了两遍，会导致 ObjC 类重复注册）:"
-  printf '%s\n' "$DUPES" | sed 's/^/         /'
+  DUP_TMP=$(mktemp)
+  printf '%s\n' "$DUPES" > "$DUP_TMP"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    HASHES=$(find "$APP" -name "$name" -type f -exec shasum -a 256 {} \; 2>/dev/null | awk '{print $1}' | sort -u | wc -l | tr -d ' ')
+    if [ "$HASHES" -gt 1 ]; then
+      bad "同名但内容不同的 Qt 库 $name（$HASHES 份）—— 两套 Qt 混在一起，必崩"
+      find "$APP" -name "$name" -type f 2>/dev/null | sed 's/^/         /'
+    else
+      warn "同名同内容的 Qt 库 $name 出现多次（同一份被复制到多处，通常无害）"
+      find "$APP" -name "$name" -type f 2>/dev/null | sed 's/^/         /'
+    fi
+  done < "$DUP_TMP"
+  rm -f "$DUP_TMP"
 else
   ok "没有同名重复的 Qt 库"
 fi
