@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import sys
 from typing import Dict, List, Optional, Tuple
@@ -41,6 +42,19 @@ DEP_CMDS = {LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB,
             LC_LOAD_UPWARD_DYLIB, LC_LAZY_LOAD_DYLIB}
 
 SYSTEM_PREFIXES = ("/usr/lib/", "/System/", "/Library/Apple/")
+
+# macOS/dyld 共享缓存里的系统库：通过 @rpath 引用也一定能加载，不该算缺失。
+# （历史上这里误报过 40 个 @rpath/libc++.1.dylib + 3 个 @rpath/libz.1.dylib。）
+SYSTEM_DYLIB_RE = re.compile(
+    r'^lib(c\+\+|c\+\+abi|System|objc|z|iconv|resolv|xml2|sqlite3|cups|edit|'
+    r'ncurses|panel|form|bsm|util|compression|apple_nghttp2|heimdal|tidy|dl|m|'
+    r'poll|proc|pthread)(\.[0-9.]+)?\.dylib$'
+)
+
+# 允许缺失的可选外部依赖（Qt SQL 驱动等按需 dlopen，缺了不影响启动）
+OPTIONAL_EXTERNAL_RE = re.compile(
+    r'^lib(mimer|iodbc|odbcinst|pq|mysqlclient|mariadb|sybdb|fbclient)[^/]*\.dylib$'
+)
 
 
 def _read_cstr(data: bytes, offset: int) -> str:
@@ -191,6 +205,28 @@ def resolve(dep: str, owner_rel: str, rpaths: List[str],
     return None
 
 
+def classify_dep(dep: str, owner_rel: str, rpaths: List[str],
+                 by_base: Dict[str, str], files: Dict[str, dict]) -> Tuple[str, str]:
+    """返回 (状态, 说明)。状态 ∈ {ok, system, optional, alias, missing}。"""
+    base = os.path.basename(dep)
+    if dep.startswith(SYSTEM_PREFIXES):
+        return "system", dep
+    if SYSTEM_DYLIB_RE.match(base):
+        return "system", "macOS 系统库"
+    if OPTIONAL_EXTERNAL_RE.match(base):
+        return "optional", "可选外部依赖（按需 dlopen）"
+    if resolve(dep, owner_rel, rpaths, by_base, files) is not None:
+        return "ok", ""
+    # 版本别名：依赖 libicui18n.78.dylib，但包里只有 libicui18n.78.3.dylib。
+    # dyld 按 install name 精确匹配，别名**不能**替代 —— 但要和"完全没有"区分开。
+    stem = base[:-len(".dylib")] if base.endswith(".dylib") else base
+    prefix = stem + "."
+    aliases = sorted(n for n in by_base if n.startswith(prefix) and n.endswith(".dylib"))
+    if aliases:
+        return "alias", "仅有版本别名: " + ", ".join(aliases[:4])
+    return "missing", ""
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print(__doc__)
@@ -203,17 +239,26 @@ def main() -> int:
 
     files = scan_bundle(root)
     by_base = _basename_index(files)
-    problems: List[str] = []
-    report = {"root": root, "macho_files": len(files), "unresolved": {}, "consumers": {}}
+    report = {"root": root, "macho_files": len(files),
+              "missing": {}, "alias_only": {}, "optional": {}, "consumers": {}}
+    missing_n = alias_n = optional_n = system_n = 0
 
     for rel, info in sorted(files.items()):
-        missing = []
         for dep in info["deps"]:
-            if resolve(dep, rel, info["rpaths"], by_base, files) is None:
-                missing.append(dep)
-        if missing:
-            report["unresolved"][rel] = missing
-            problems.append(f"{rel} 缺少依赖: {', '.join(missing)}")
+            state, detail = classify_dep(dep, rel, info["rpaths"], by_base, files)
+            if state == "system":
+                system_n += 1
+            elif state == "ok":
+                pass
+            elif state == "optional":
+                optional_n += 1
+                report["optional"].setdefault(rel, []).append(dep)
+            elif state == "alias":
+                alias_n += 1
+                report["alias_only"].setdefault(rel, []).append(f"{dep} ({detail})")
+            else:
+                missing_n += 1
+                report["missing"].setdefault(rel, []).append(dep)
 
     # 两套 Qt 检测
     naked = [r for r in files if os.path.basename(r).startswith("libQt6") and r.endswith(".dylib")]
@@ -221,10 +266,8 @@ def main() -> int:
     report["naked_qt"] = sorted(os.path.basename(r) for r in naked)
     report["framework_qt"] = sorted({r.split(".framework/")[0].split("/")[-1] for r in framed})
 
-    # 关键消费方
     for key in ("platforms/libqcocoa.dylib",):
-        hits = [r for r in files if r.endswith(key)]
-        for h in hits:
+        for h in [r for r in files if r.endswith(key)]:
             report["consumers"][h] = [d for d in files[h]["deps"] if "Qt" in d]
 
     if as_json:
@@ -232,22 +275,33 @@ def main() -> int:
     else:
         print(f"bundle      : {root}")
         print(f"Mach-O 文件 : {len(files)}")
-        print(f"裸 Qt 库    : {len(naked)} 个  {report['naked_qt'][:8]}")
+        print(f"裸 Qt 库    : {len(naked)} 个  {report['naked_qt'][:10]}")
         print(f"framework Qt: {len(framed)} 个  {report['framework_qt'][:8]}")
+        # 关键依赖清单（icu/libc++ 这类历史上误报过的）
+        for pat in ("libicu", "libc++", "libz."):
+            hits = sorted({os.path.basename(r) for r in files if os.path.basename(r).startswith(pat)})
+            print(f"包内 {pat:<7}: {len(hits)} 个  {hits[:6]}")
         for h, deps in report["consumers"].items():
             print(f"\n{h} 的 Qt 依赖:")
             for d in deps:
-                mark = "ok  " if resolve(d, h, files[h]["rpaths"], by_base, files) else "MISS"
-                print(f"  [{mark}] {d}")
-        print()
-        if problems:
-            print(f"未解析依赖 {len(problems)} 处:")
-            for p in problems[:40]:
-                print("  - " + p)
+                st, _ = classify_dep(d, h, files[h]["rpaths"], by_base, files)
+                print(f"  [{st:<8}] {d}")
+        print(f"\n依赖统计: 系统库 {system_n} | 可选外部 {optional_n} | "
+              f"版本别名 {alias_n} | 真缺失 {missing_n}")
+        if report["alias_only"]:
+            print("\n[警告] 以下依赖只有版本别名（dyld 按精确名匹配，可能有风险）:")
+            for rel, deps in list(report["alias_only"].items())[:10]:
+                print(f"  - {rel}: {deps[:3]}")
+        if report["optional"]:
+            print(f"\n[提示] 可选外部依赖（Qt SQL 驱动等，缺失不影响启动）: {optional_n} 处")
+        if report["missing"]:
+            print(f"\n[FAIL] 真正缺失 {missing_n} 处:")
+            for rel, deps in list(report["missing"].items())[:30]:
+                print(f"  - {rel} 缺少依赖: {', '.join(deps)}")
         else:
-            print("所有 Mach-O 依赖都能在 bundle 内解析。")
+            print("\n没有任何非系统依赖缺失。")
 
-    bad = bool(problems)
+    bad = missing_n > 0
     if naked and framed:
         bad = True
         print("\n[FAIL] 同时存在裸 dylib Qt 与 framework Qt（两套 Qt）—— "
