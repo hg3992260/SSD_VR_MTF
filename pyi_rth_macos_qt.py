@@ -83,8 +83,9 @@ def _main():
     lib_dirs = [
         frameworks,
         os.path.join(frameworks, 'PySide6', 'Qt', 'lib'),
+        os.path.join(resources, 'lib'),          # spec 的 soname 实体就落在这里
+        resources,
         os.path.join(resources, 'PySide6', 'Qt', 'lib'),
-        os.path.join(resources, 'lib'),
         exe_dir,
     ]
     lib_hits = _prepend_path('DYLD_FALLBACK_LIBRARY_PATH', lib_dirs)

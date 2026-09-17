@@ -330,7 +330,17 @@ def _stage_soname(name, src):
 
 
 def _dep_closure(binaries, lib_dirs, dep_reader=_deps_via_otool, stager=_stage_soname):
-    """补入缺失的 soname 名字。返回 (added, still_missing)。可注入依赖读取器/实体化器便于单测。"""
+    """补入缺失的 soname 名字。返回 (added, still_missing)。
+
+    注意：**必须作为 datas（dest='lib/<name>'）挂进去，不能作为 binaries**。
+    PyInstaller 6 对 binaries 按内容去重：conda 的 libicuuc.78.dylib 与已收集的
+    libicuuc.78.3.dylib 内容相同 → 我加进去的那份会被静默丢掉（实测：文件数不变）。
+    datas 不做内容去重，落到 Contents/Resources/lib/，而 runtime hook 已经把
+    Contents/Resources/lib 放进 DYLD_FALLBACK_LIBRARY_PATH，dyld 解析
+    @rpath/libicuuc.78.dylib 失败时会去那里找。
+
+    返回的 added 是名字列表；调用方负责把 staged 文件加进 a.datas。
+    """
     have = {os.path.basename(str(e[0]).replace('\\', '/')) for e in binaries}
     added, missing = [], []
     for dest, src, _typ in list(binaries):
@@ -348,9 +358,8 @@ def _dep_closure(binaries, lib_dirs, dep_reader=_deps_via_otool, stager=_stage_s
             for d in lib_dirs:
                 cand = os.path.join(str(d), name)
                 if os.path.isfile(cand) or os.path.islink(cand):
-                    binaries.append((name, stager(name, cand), 'BINARY'))
+                    added.append((name, stager(name, cand)))
                     have.add(name)
-                    added.append(name)
                     placed = True
                     break
             if not placed:
@@ -371,13 +380,20 @@ except Exception:
 _lib_search = [d for d in _lib_search if os.path.isdir(d)]
 
 _added, _still_missing = _dep_closure(a.binaries, _lib_search)
-print(f'[spec] 依赖名闭合: 补入 {len(_added)} 个 {sorted(set(_added))[:12]}')
+if _added:
+    already = {os.path.basename(str(e[0]).replace('\\', '/')) for e in a.datas}
+    for _name, _path in _added:
+        if _name not in already:
+            a.datas.append((f'lib/{_name}', _path, 'DATA'))
+print(f'[spec] 依赖名闭合: 补入 {len(_added)} 个 soname -> Contents/Resources/lib/ '
+      f'{sorted({n for n, _ in _added})[:12]}')
 if _still_missing:
     print(f'[spec] 仍未解析的非系统依赖: {_still_missing[:20]}')
 
 # Qt 库是启动必需的：任何非系统依赖仍缺失就失败，别产出"只在 CI 上能跑"的包
 _qt_missing = []
-_have_after = {os.path.basename(str(e[0]).replace('\\', '/')) for e in a.binaries}
+_have_after = {os.path.basename(str(e[0]).replace('\\', '/'))
+               for e in list(a.binaries) + list(a.datas)}
 for _dest, _src, _t in a.binaries:
     _b = os.path.basename(str(_dest).replace('\\', '/'))
     if not (_b.startswith('libQt6') and _b.endswith('.dylib')):
