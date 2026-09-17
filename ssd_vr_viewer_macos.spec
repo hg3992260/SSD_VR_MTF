@@ -179,8 +179,15 @@ def _qt_audit(tocs):
             if not (is_lib or is_fw):
                 continue
             families.add('wheel' if '/PySide6/Qt/' in dest else 'conda')
-            key = base if is_lib else dest.split('.framework/')[0].rsplit('/', 1)[-1] + '.framework'
-            dests_by_key.setdefault(key, []).append(dest)
+            if is_lib:
+                key, what = base, dest
+            else:
+                # framework 内部有很多文件：key 用 framework 名，值归一到 framework 根，
+                # 这样"同一 framework 的多个文件"不会被误判成重复，
+                # 而"同名 framework 出现在两个目录"会被正确检出。
+                root = dest.split('.framework', 1)[0] + '.framework'
+                key, what = root.rsplit('/', 1)[-1], root
+            dests_by_key.setdefault(key, []).append(what)
     dupes = {k: sorted(set(v)) for k, v in dests_by_key.items() if len(set(v)) > 1}
     return sorted(families), dupes
 
