@@ -38,22 +38,36 @@ jobs:
         shell: bash -el {0}
         run: |
           set -euo pipefail
-          echo "--- PySide6 来源 ---"
           python - <<'PY'
-          import PySide6, os, pathlib, sys
+          import os, pathlib, sys
+          import PySide6
+
           root = pathlib.Path(PySide6.__path__[0])
-          print("PySide6:", root)
+          meta = pathlib.Path(os.environ.get("CONDA_PREFIX", "")) / "conda-meta"
+          has_pyside6 = bool(list(meta.glob("pyside6-*.json"))) if meta.is_dir() else False
+          has_qt = bool(list(meta.glob("qt6-*.json"))) if meta.is_dir() else False
           fw = list(root.rglob("Qt*.framework"))
-          print("wheel 版 framework 数量:", len(fw))
+
+          print(f"PySide6 路径    : {root}")
+          print(f"conda-meta pyside6: {has_pyside6}")
+          print(f"conda-meta qt6-*  : {has_qt}")
+          print(f"wheel framework   : {len(fw)}")
+
+          # 注意：conda 装的包也会出现在 `pip list` 里，所以**不能**用 pip list 判断来源。
+          # 唯一可靠的证据是 conda-meta 记录 + 包里有没有 framework。
+          problems = []
+          if not has_pyside6:
+              problems.append("conda-meta 里没有 pyside6 → PySide6 来自 pip wheel，会与 conda Qt 混装")
+          if not has_qt:
+              problems.append("conda-meta 里没有 qt6-* → conda 侧 Qt 不完整")
           if fw:
-              print("样例:", [str(p) for p in fw[:3]])
-              sys.exit("检测到 pip wheel 版 PySide6（framework）—— 与 conda Qt 混装，必须统一")
+              problems.append(f"PySide6 内含 Qt framework（wheel 特征）: {[str(p) for p in fw[:2]]}")
+          if problems:
+              for p in problems:
+                  print(f"::error::{p}")
+              sys.exit("Qt 来源不唯一，见上面的 ::error:: 行")
+          print("OK: 环境里只有 conda-forge 的一份 Qt")
           PY
-          echo "--- 不应有 pip 版 PySide6 / PyQt ---"
-          if pip list 2>/dev/null | grep -iE '^(PySide6|PyQt5|PyQt6) '; then
-            echo "::error::pip 里存在 PySide6/PyQt wheel —— 会与 conda Qt 混装"
-            exit 1
-          fi
           echo "--- conda Qt（裸 dylib）---"
           ls "$CONDA_PREFIX/lib" | grep -E '^libQt6(Core|Gui|Widgets)' || true
           echo "--- Qt 运行时版本 ---"
