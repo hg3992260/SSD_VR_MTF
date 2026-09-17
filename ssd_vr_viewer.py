@@ -12,6 +12,92 @@ def _external_dir() -> str:
         return os.path.dirname(os.path.abspath(sys.executable))
     return current_dir
 
+
+# ---------------------------------------------------------------------------
+# macOS 冻结包：定位 Qt 插件与 Qt 库
+# ---------------------------------------------------------------------------
+# 背景（2026-09-17 DMG 启动 SIGABRT）：CI 上同时存在两套 Qt —— conda-forge 的 vtk
+# 链接**裸 dylib**（libQt6Gui.6.dylib），pip 的 PySide6 是 **framework**
+# （QtGui.framework/.../QtGui）。旧 spec 把裸 dylib 删光，导致裸命名的平台插件
+# libqcocoa.dylib 变成孤儿，QApplication 构造时 qFatal → abort()。
+#
+# 现在 spec 不再删任何 Qt 库、并把插件统一收到 PySide6/Qt/plugins；本函数是运行时
+# 兜底：把可能的目录都找一遍，按"真的含有 platforms/libqcocoa.dylib"来判定，
+# 再通过环境变量告诉 Qt（环境变量优先级高于 qt.conf，找不到时不会污染）。
+
+def _macos_qt_candidates(executable: str = "", resources: str = "") -> dict:
+    """返回候选目录（纯路径计算，不碰环境变量、不要求目录存在，便于单元测试）。"""
+    exe = os.path.abspath(executable or sys.executable)
+    exe_dir = os.path.dirname(exe)
+    contents = os.path.dirname(exe_dir)                      # .../X.app/Contents
+    res = os.path.abspath(resources) if resources else os.path.join(contents, "Resources")
+
+    plugin_names = [
+        os.path.join("PySide6", "Qt", "plugins"),            # spec/新布局（统一落点）
+        os.path.join("PySide6", "plugins"),                  # pip 备选
+        "plugins",
+        os.path.join("qt6", "plugins"),                      # conda 备选
+    ]
+    plugin_dirs = [os.path.join(res, p) for p in plugin_names]
+    plugin_dirs += [
+        os.path.join(contents, "PlugIns"),                   # 传统 bundle 位置
+        os.path.join(contents, "Frameworks", "PySide6", "Qt", "plugins"),
+        os.path.join(exe_dir, "PySide6", "Qt", "plugins"),   # onedir 风格
+    ]
+
+    lib_dirs = [
+        os.path.join(res, "PySide6", "Qt", "lib"),
+        os.path.join(res, "lib"),
+        os.path.join(contents, "Frameworks"),
+        exe_dir,
+    ]
+    return {"exe": exe, "resources": res, "plugin_dirs": plugin_dirs, "lib_dirs": lib_dirs}
+
+
+def _setup_macos_qt_paths(executable: str = "", resources: str = "",
+                          environ: dict = None, log=None) -> dict:
+    """在 QApplication 之前设置 Qt 插件/库搜索路径。返回找到的目录，便于日志与测试。
+
+    - QT_PLUGIN_PATH / QT_QPA_PLATFORM_PLUGIN_PATH：指向真正含 libqcocoa 的目录
+    - DYLD_FALLBACK_LIBRARY_PATH：附上候选库目录（比 DYLD_LIBRARY_PATH 更可靠，
+      签名/加固运行时经常把后者剥掉）
+    """
+    env = os.environ if environ is None else environ
+    cand = _macos_qt_candidates(executable, resources)
+
+    def _has_cocoa(d: str) -> bool:
+        return os.path.isfile(os.path.join(d, "platforms", "libqcocoa.dylib"))
+
+    plugin_dir = ""
+    for d in cand["plugin_dirs"]:
+        if _has_cocoa(d):
+            plugin_dir = d
+            break
+    if not plugin_dir:                        # 退而求其次：存在 platforms 子目录即可
+        for d in cand["plugin_dirs"]:
+            if os.path.isdir(os.path.join(d, "platforms")):
+                plugin_dir = d
+                break
+
+    if plugin_dir:
+        prev = env.get("QT_PLUGIN_PATH", "")
+        env["QT_PLUGIN_PATH"] = plugin_dir + (os.pathsep + prev if prev else "")
+        platforms = os.path.join(plugin_dir, "platforms")
+        if os.path.isdir(platforms):
+            env["QT_QPA_PLATFORM_PLUGIN_PATH"] = platforms
+
+    found_libs = [d for d in cand["lib_dirs"] if os.path.isdir(d)]
+    if found_libs:
+        prev = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+        env["DYLD_FALLBACK_LIBRARY_PATH"] = os.pathsep.join(
+            found_libs + ([prev] if prev else []))
+
+    if log is not None:
+        log(f"[macOS] plugin_dir={plugin_dir or '(none)'} lib_dirs={found_libs}")
+
+    return {"plugin_dir": plugin_dir, "lib_dirs": found_libs,
+            "plugin_candidates": cand["plugin_dirs"], "resources": cand["resources"]}
+
 # Inject the pv_packages directory into sys.path to allow pvpython to find PyQt5 and SimpleITK
 if sys.platform == "win32":
     pv_packages_dir = os.path.join(current_dir, "pv_packages")
@@ -5915,15 +6001,13 @@ def main() -> int:
                 pass
 
     if sys.platform == "darwin" and getattr(sys, "frozen", False):
-        res_dir = os.path.join(os.path.dirname(sys.executable), "..", "Resources")
-        plugin_path = os.path.join(res_dir, "PySide6", "Qt", "plugins")
-        if os.path.isdir(plugin_path):
-            os.environ["QT_PLUGIN_PATH"] = plugin_path
-            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(plugin_path, "platforms")
-        lib_path = os.path.join(res_dir, "PySide6", "Qt", "lib")
-        if os.path.isdir(lib_path):
-            current_dyld = os.environ.get("DYLD_LIBRARY_PATH", "")
-            os.environ["DYLD_LIBRARY_PATH"] = lib_path + (":" + current_dyld if current_dyld else "")
+        _qt = _setup_macos_qt_paths()
+        print(f"[macOS] QT_PLUGIN_PATH={_qt['plugin_dir']} "
+              f"(lib dirs: {len(_qt['lib_dirs'])})", flush=True)
+        if not _qt["plugin_dir"]:
+            print("[macOS] WARNING: no Qt platform plugin dir found in the bundle; "
+                  "the app will likely fail to start (see ssd_vr_viewer_macos.spec).",
+                  flush=True)
 
     parser = argparse.ArgumentParser(description="PySide6 SSD+VR DICOM viewer (Figure 8 style fusion).")
     parser.add_argument("--input", default="", help="DICOM folder path or a single DICOM file")
