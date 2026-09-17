@@ -118,7 +118,9 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    # macOS 上必须用 runtime hook 提前设好 dyld/Qt 搜索路径：
+    # ssd_vr_viewer.py 在**模块级**就 import PySide6，等 main() 再设就太迟了。
+    runtime_hooks=['pyi_rth_macos_qt.py'],
     # 注意：**不能**排除 PySide6.QtNetwork / QtDBus —— cocoa 插件会用到。
     excludes=['tkinter', 'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets',
               'PySide6.QtWebEngineQuick', 'PySide6.QtQuick', 'PySide6.QtQuickWidgets'],
@@ -263,6 +265,113 @@ if _provider_problems:
 if _dupes:
     raise SystemExit('[spec] FAIL: 同一个 Qt 组件被装了两遍 ' + str(list(_dupes)[:8]) + _FIX_HINT)
 print('[spec] OK: 只有一套 Qt（conda-forge），无重复组件')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 构建期守卫 3/3：依赖「名字」闭合
+#
+# conda 的 libicu/libbz2/libexpat 用 symlink 提供 soname：
+#     libicuuc.78.dylib -> libicuuc.78.3.dylib
+# PyInstaller 收集时解析 symlink，包里只剩 libicuuc.78.3.dylib，而
+# libQt6Core 的 install name 写的是 @rpath/libicuuc.78.dylib →
+#   · CI 上 conda 目录还在，恰好能找到 → 冒烟测试通过（假阳性）
+#   · 用户机器上没有 conda → 启动即崩
+# 这里把「被引用但没有精确同名文件」的依赖从 conda 前缀补进包（名字保持原样）。
+# ════════════════════════════════════════════════════════════════════════════
+_SYSTEM_DEP_RE = re.compile(
+    r'^lib(c\+\+|c\+\+abi|System|objc|z|iconv|resolv|xml2|sqlite3|cups|edit|'
+    r'ncurses|panel|form|bsm|util|compression|apple_nghttp2|heimdal|tidy|dl|m|'
+    r'poll|proc|pthread)(\.[0-9.]+)?\.dylib$'
+)
+_OPTIONAL_DEP_RE = re.compile(
+    r'^lib(mimer|iodbc|odbcinst|pq|mysqlclient|mariadb|sybdb|fbclient)[^/]*\.dylib$'
+)
+
+
+def _deps_via_otool(src):
+    """用 otool 读一个 Mach-O 的依赖名（macOS 自带）。失败返回 []。"""
+    import subprocess
+    try:
+        out = subprocess.run(['otool', '-L', str(src)], capture_output=True,
+                             text=True, timeout=60).stdout
+    except Exception:
+        return []
+    deps = []
+    for line in out.splitlines()[1:]:
+        dep = line.strip().split(' ')[0].strip()
+        if dep:
+            deps.append(dep)
+    return deps
+
+
+def _dep_closure(binaries, lib_dirs, dep_reader=_deps_via_otool):
+    """补入缺失的 soname 名字。返回 (added, still_missing)。可注入 dep_reader 便于单测。"""
+    have = {os.path.basename(str(e[0]).replace('\\', '/')) for e in binaries}
+    added, missing = [], []
+    for dest, src, _typ in list(binaries):
+        if not str(src).endswith(('.dylib', '.so')):
+            continue
+        for dep in dep_reader(src):
+            if not dep.startswith('@rpath/'):
+                continue
+            name = dep[len('@rpath/'):]
+            if '/' in name or name in have:
+                continue
+            if _SYSTEM_DEP_RE.match(name) or _OPTIONAL_DEP_RE.match(name):
+                continue
+            placed = False
+            for d in lib_dirs:
+                cand = os.path.join(str(d), name)
+                if os.path.isfile(cand) or os.path.islink(cand):
+                    binaries.append((name, cand, 'BINARY'))
+                    have.add(name)
+                    added.append(name)
+                    placed = True
+                    break
+            if not placed:
+                missing.append(name)
+    return added, sorted(set(missing))
+
+
+_lib_search = []
+for _p in _prefixes():
+    _lib_search += [os.path.join(_p, 'lib'), os.path.join(_p, 'lib', 'qt6'), os.path.join(_p, 'lib64')]
+try:
+    _imported = __import__('PySide6')
+    import pathlib as _pl
+    _ps_root = _pl.Path(_imported.__path__[0])
+    _lib_search += [str(_ps_root / 'Qt' / 'lib'), str(_ps_root / 'Qt' / 'libexec')]
+except Exception:
+    pass
+_lib_search = [d for d in _lib_search if os.path.isdir(d)]
+
+_added, _still_missing = _dep_closure(a.binaries, _lib_search)
+print(f'[spec] 依赖名闭合: 补入 {len(_added)} 个 {sorted(set(_added))[:12]}')
+if _still_missing:
+    print(f'[spec] 仍未解析的非系统依赖: {_still_missing[:20]}')
+
+# Qt 库是启动必需的：任何非系统依赖仍缺失就失败，别产出"只在 CI 上能跑"的包
+_qt_missing = []
+_have_after = {os.path.basename(str(e[0]).replace('\\', '/')) for e in a.binaries}
+for _dest, _src, _t in a.binaries:
+    _b = os.path.basename(str(_dest).replace('\\', '/'))
+    if not (_b.startswith('libQt6') and _b.endswith('.dylib')):
+        continue
+    for _dep in _deps_via_otool(_src):
+        if not _dep.startswith('@rpath/'):
+            continue
+        _n = _dep[len('@rpath/'):]
+        if '/' in _n or _n in _have_after:
+            continue
+        if _SYSTEM_DEP_RE.match(_n) or _OPTIONAL_DEP_RE.match(_n):
+            continue
+        _qt_missing.append(f'{_b} -> {_n}')
+if _qt_missing:
+    raise SystemExit(
+        '[spec] FAIL: Qt 库仍有未打包的非系统依赖 ' + str(sorted(set(_qt_missing))[:10])
+        + '\n  说明依赖名闭合没生效（conda 前缀里找不到这些文件？）。'
+        + '\n  这类包在 CI 上能启动、到用户机器上必崩，因此直接构建失败。\n')
+print('[spec] OK: Qt 库依赖名闭合')
 
 # 去重兜底（万一 hook 与 collect_all 撞了同一 dest，保留第一个）
 try:
