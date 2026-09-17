@@ -26,32 +26,41 @@ def _external_dir() -> str:
 # 再通过环境变量告诉 Qt（环境变量优先级高于 qt.conf，找不到时不会污染）。
 
 def _macos_qt_candidates(executable: str = "", resources: str = "") -> dict:
-    """返回候选目录（纯路径计算，不碰环境变量、不要求目录存在，便于单元测试）。"""
+    """返回候选目录（纯路径计算，不碰环境变量、不要求目录存在，便于单元测试）。
+
+    注意 PyInstaller 的 BUNDLE 会把 **binaries 放进 Contents/Frameworks**、
+    datas 放进 Contents/Resources —— 实测（2026-09-17 崩溃报告）Qt 库与插件都在
+    Contents/Frameworks/PySide6/Qt/... 下，所以 Frameworks 必须排在前面。
+    """
     exe = os.path.abspath(executable or sys.executable)
     exe_dir = os.path.dirname(exe)
     contents = os.path.dirname(exe_dir)                      # .../X.app/Contents
     res = os.path.abspath(resources) if resources else os.path.join(contents, "Resources")
+    fw = os.path.join(contents, "Frameworks")
 
-    plugin_names = [
-        os.path.join("PySide6", "Qt", "plugins"),            # spec/新布局（统一落点）
-        os.path.join("PySide6", "plugins"),                  # pip 备选
-        "plugins",
-        os.path.join("qt6", "plugins"),                      # conda 备选
-    ]
-    plugin_dirs = [os.path.join(res, p) for p in plugin_names]
-    plugin_dirs += [
+    plugin_dirs = [
+        # PyInstaller BUNDLE 的实际落点（binaries -> Contents/Frameworks）
+        os.path.join(fw, "PySide6", "Qt", "plugins"),
+        os.path.join(fw, "PySide6", "plugins"),
+        os.path.join(fw, "plugins"),
         os.path.join(contents, "PlugIns"),                   # 传统 bundle 位置
-        os.path.join(contents, "Frameworks", "PySide6", "Qt", "plugins"),
-        os.path.join(exe_dir, "PySide6", "Qt", "plugins"),   # onedir 风格
+        # onedir / 旧布局兜底（datas -> Contents/Resources）
+        os.path.join(res, "PySide6", "Qt", "plugins"),
+        os.path.join(res, "PySide6", "plugins"),
+        os.path.join(res, "plugins"),
+        os.path.join(res, "qt6", "plugins"),
+        os.path.join(exe_dir, "PySide6", "Qt", "plugins"),
     ]
 
     lib_dirs = [
+        fw,                                                  # conda 裸 dylib 常在这
+        os.path.join(fw, "PySide6", "Qt", "lib"),            # pyside6 wheel 的 Qt
         os.path.join(res, "PySide6", "Qt", "lib"),
         os.path.join(res, "lib"),
-        os.path.join(contents, "Frameworks"),
         exe_dir,
     ]
-    return {"exe": exe, "resources": res, "plugin_dirs": plugin_dirs, "lib_dirs": lib_dirs}
+    return {"exe": exe, "resources": res, "frameworks": fw,
+            "plugin_dirs": plugin_dirs, "lib_dirs": lib_dirs}
 
 
 def _setup_macos_qt_paths(executable: str = "", resources: str = "",

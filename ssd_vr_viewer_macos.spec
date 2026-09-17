@@ -1,60 +1,56 @@
 # -*- mode: python ; coding: utf-8 -*-
 """macOS .app 打包（PyInstaller spec）。
 
-────────────────────────────────────────────────────────────────────────────
-Qt 布局坑 —— 2026-09-17 DMG 启动 SIGABRT 复盘（务必先读）
-────────────────────────────────────────────────────────────────────────────
-现象: 打包后的 .app 启动即 abort()，Qt 原文 "Could not load the Qt platform plugin
-      cocoa"；QT_DEBUG_PLUGINS=1 显示 libqcocoa.dylib 需要
-      @rpath/libQt6Gui.6.dylib 而包里没有。
+════════════════════════════════════════════════════════════════════════════
+两次崩溃的复盘（务必先读；改这个文件前请确认你理解这两条）
+════════════════════════════════════════════════════════════════════════════
+【第一次】SIGABRT：QApplication 构造时 qFatal
+  现象: "Could not load the Qt platform plugin cocoa"，
+        QT_DEBUG_PLUGINS=1 显示 libqcocoa.dylib 需要 @rpath/libQt6Gui.6.dylib 而包里没有。
+  原因: CI 上同时装了两套 Qt —— conda-forge 的 vtk 链接**裸 dylib** Qt，
+        pip 的 PySide6 是 **framework** Qt；旧 spec 有两段代码把裸命名的
+        libQt6*.dylib 全部删掉（"avoid conflict with PySide6's framework Qt"），
+        于是裸命名的插件成了孤儿。
+  修法: 不再删任何 Qt（本文件已无任何过滤）。
 
-根因: CI 上同时存在**两套命名不同的 Qt**
-        · conda-forge 的 vtk  → 裸 dylib 布局 (libQt6Core.6.dylib / libQt6Gui.6.dylib)
-        · pip 的 PySide6       → macOS framework 布局 (QtGui.framework/Versions/A/QtGui)
-      旧版 spec 有两段代码把「裸命名」的 libQt6*.dylib 全部从包里删掉（注释写的是
-      "avoid conflict with PySide6's framework Qt"）。结果：裸命名的插件
-      (libqcocoa.dylib、libvtkRenderingQt 依赖) 被留下，但它们需要的裸命名库被删光
-      → 插件成孤儿 → QApplication 构造时 qFatal → abort() → SIGABRT。
+【第二次】EXC_BAD_ACCESS：事件循环里随机崩（processExposeEvent → NSOpenGLView）
+  现象: 启动日志里 "Class QMetalLayer is implemented in both
+        .../libQt6Gui.6.dylib and .../PySide6/Qt/lib/QtGui.framework/.../QtGui"。
+  原因: 只"不删"还不够 —— 两个发行版的 Qt 会**同时进包**，同一个 Qt 出现三份：
+        Frameworks/libQt6*.dylib（conda）+ Frameworks/PySide6/Qt/lib/libQt6*.6.11.2.dylib
+        （pip wheel）+ Frameworks/PySide6/Qt/lib/Qt*.framework（pip wheel）。
+        ObjC 类重复注册 → 随机崩溃。
+  修法: ① CI 侧把 Qt 统一到 conda-forge 的 pyside6（见 .github/workflows/macos.yml，
+        关键是 `pip install --no-deps PyCt6`，否则 pip 又把 wheel 版拉回来）；
+        ② 本文件和 CI 都有"只允许一套 Qt"的守卫：宁可构建失败，也不产出会崩的包。
 
-修复原则（本文件遵守）:
-  1. **绝不删除任何 Qt 库**。删库只在"全 pip 单套 Qt"的假设下成立，本项目不成立。
-  2. 插件与裸 dylib 从 **pip 与 conda 两种布局**都能收到，统一落到
-     PySide6/Qt/plugins 与 PySide6/Qt/lib，并写 Resources/qt.conf 告诉 Qt 去哪找。
-  3. 版本必须同源同版：插件 6.11.2 配 6.11.0 的库会因缺符号失败
-     (Symbol not found: QPlatformVulkanInstance::beginFrame)。所以 CI 侧
-     (macos.yml) 把 Qt 统一到 conda-forge 的 pyside6，并用
-     tools/verify_macos_bundle.sh 做硬门禁。
-  4. 运行时兜底见 ssd_vr_viewer.py 的 _setup_macos_qt_paths()：多个候选目录都试一遍。
+用户级结论：**Qt 只能有一个来源**。本 spec 只做三件事：
+  1. 四个 collect_all（PyCt6 / vtkmodules / SimpleITK / PySide6）—— 与已知能跑的
+     DICOM_Analysis_Tool.app 的 spec 同构（它没有任何 Qt 过滤）；
+  2. Qt 库/插件**不做显式重复收集**（交给 PyInstaller 的 PySide6 hook + 依赖分析，
+     显式再收一份只会制造 "implemented in both"）；只有在 hook 完全没收到
+     cocoa 插件时才补一次兜底；
+  3. 构建期守卫 _qt_audit()：出现两套 Qt 发行版、或同一个 Qt 组件落在两个 dest，
+     直接 SystemExit 并打印修复指引。
 """
 import os
+import re
 import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
 
-# ── PyCt6: 强制收集数据文件（主题 JSON）+ 二进制
+# ── 四个包全量收集 ───────────────────────────────────────────────────────────
 pct6_datas, pct6_bins, pct6_hidden = collect_all('PyCt6')
-# ── VTK（Python 包；libvtk*.dylib 由 PyInstaller 的 vtkmodules hook + 依赖分析收）
 vtk_datas, vtk_bins, vtk_hidden = collect_all('vtkmodules')
-# ── SimpleITK
 sitk_datas, sitk_bins, sitk_hidden = collect_all('SimpleITK')
-# ── PySide6: 全量收集（Qt 框架/裸库 + 插件 + shiboken）
 ps6_datas, ps6_bins, ps6_hidden = collect_all('PySide6')
 
-# ────────────────────────────────────────────────────────────────────────────
-# Qt 插件 / 裸 dylib 显式收集（pip framework 与 conda dylib 两种布局都覆盖）
-# 全部只为"补漏"：目录不存在就跳过，任何异常都不该弄挂构建。
-# ────────────────────────────────────────────────────────────────────────────
+# ── 兜底用的 Qt 插件候选目录（只在 hook 没跑到时才用；正常构建不会用到） ─────
 QT_PLUGIN_DST = 'PySide6/Qt/plugins'
-QT_LIB_DST = 'PySide6/Qt/lib'
-QT_LIB_GLOBS = ('libQt6*.dylib', 'libQt*.dylib', 'libicu*.dylib')
-QT_PLUGIN_SUBDIRS = ('platforms', 'styles', 'imageformats', 'iconengines',
-                     'platformthemes', 'platforminputcontexts', 'tls',
-                     'generic', 'networkinformation', 'printsupport')
 
 
 def _prefixes():
-    """可能装着 Qt 的前缀：conda 环境、当前解释器前缀、解释器所在目录。"""
     out = []
     for p in (os.environ.get('CONDA_PREFIX'), os.environ.get('PREFIX'),
               sys.prefix, os.path.dirname(os.path.dirname(sys.executable)),
@@ -74,8 +70,7 @@ def _pyside6_roots():
     for p in _prefixes():
         for cand in (Path(p) / 'lib', Path(p)):
             try:
-                for sp in cand.glob('python3.*/site-packages/PySide6'):
-                    out.append(sp)
+                out += list(cand.glob('python3.*/site-packages/PySide6'))
             except Exception:
                 pass
     return [r for r in out if r.is_dir()]
@@ -92,73 +87,17 @@ def _plugin_dirs():
     return [d for d in out if d.is_dir()]
 
 
-def _lib_dirs():
-    out = []
-    for root in _pyside6_roots():
-        out += [root / 'Qt' / 'lib', root / 'Qt' / 'libexec']
-    for p in _prefixes():
-        base = Path(p)
-        out += [base / 'lib', base / 'lib' / 'qt6', base / 'lib' / 'qt6' / 'lib']
-    return [d for d in out if d.is_dir()]
-
-
-qt_bins = []
-qt_datas = []
-_plug_seen = set()
-for _d in _plugin_dirs():
-    for _f in sorted(_d.rglob('*')):
-        if not _f.is_file() or _f.is_symlink():
-            continue
-        _rel = _f.relative_to(_d).as_posix()
-        if _rel in _plug_seen:
-            continue
-        _plug_seen.add(_rel)
-        _sub = os.path.dirname(_rel)
-        _dest = f'{QT_PLUGIN_DST}/{_sub}' if _sub else QT_PLUGIN_DST
-        if _f.suffix in ('.dylib', '.so'):
-            qt_bins.append((str(_f), _dest))
-        else:
-            qt_datas.append((str(_f), _dest))
-
-_lib_seen = set()
-for _d in _lib_dirs():
-    for _pat in QT_LIB_GLOBS:
-        for _f in sorted(_d.glob(_pat)):
-            if not _f.is_file() or _f.is_symlink():
-                continue
-            if _f.name in _lib_seen:
-                continue
-            _lib_seen.add(_f.name)
-            qt_bins.append((str(_f), QT_LIB_DST))
-
-print(f'[spec] Qt plugin dirs: {[str(d) for d in _plugin_dirs()]}')
-print(f'[spec] Qt lib dirs   : {[str(d) for d in _lib_dirs()]}')
-print(f'[spec] +{len(qt_bins)} Qt binaries, +{len(qt_datas)} Qt data files')
-
-# ── Resources/qt.conf：macOS 上 Qt 会读 Contents/Resources/qt.conf
-_qtconf_dir = Path('build_qtconf')
-_qtconf_dir.mkdir(exist_ok=True)
-_qtconf = _qtconf_dir / 'qt.conf'
-_qtconf.write_text(
-    '[Paths]\n'
-    'Prefix = .\n'
-    f'Plugins = {QT_PLUGIN_DST}\n'
-    f'Libraries = {QT_LIB_DST}\n',
-    encoding='utf-8',
-)
-
 a = Analysis(
     ['ssd_vr_viewer.py'],
     pathex=[],
-    binaries=pct6_bins + vtk_bins + sitk_bins + ps6_bins + qt_bins,
-    datas=pct6_datas + vtk_datas + sitk_datas + ps6_datas + qt_datas + [
+    binaries=pct6_bins + vtk_bins + sitk_bins + ps6_bins,
+    datas=pct6_datas + vtk_datas + sitk_datas + ps6_datas + [
         ('scientific.json', '.'),
         ('dark.qss', '.'),
         ('presets.xml', '.'),
         ('logo.jpg', '.'),
         ('segmentation', 'segmentation'),
         ('mcp_ssd_vr', 'mcp_ssd_vr'),
-        (str(_qtconf), '.'),
     ],
     hiddenimports=[
         'PyCt6',
@@ -180,13 +119,98 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # 注意：这里**不能**排除 PySide6.QtNetwork / QtDBus —— cocoa 插件会用到它们。
+    # 注意：**不能**排除 PySide6.QtNetwork / QtDBus —— cocoa 插件会用到。
     excludes=['tkinter', 'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets',
               'PySide6.QtWebEngineQuick', 'PySide6.QtQuick', 'PySide6.QtQuickWidgets'],
     noarchive=False,
 )
 
-# 兜底：万一某条目重复（hook 已收过），保留第一个，避免 PyInstaller 报 duplicate。
+
+# ════════════════════════════════════════════════════════════════════════════
+# 构建期守卫 1/2：cocoa 插件兜底（只在 hook 一个都没收到时才补，绝不重复）
+# ════════════════════════════════════════════════════════════════════════════
+def _has_cocoa(toc):
+    return any('libqcocoa' in str(e[0]) for e in toc)
+
+
+if not (_has_cocoa(a.binaries) or _has_cocoa(a.datas)):
+    print('[spec] WARNING: PySide6 hook 没收集到平台的 libqcocoa，改用兜底收集')
+    _seen = set()
+    for _d in _plugin_dirs():
+        for _f in sorted(_d.rglob('*')):
+            if not _f.is_file() or _f.is_symlink():
+                continue
+            _rel = _f.relative_to(_d).as_posix()
+            if _rel in _seen:
+                continue
+            _seen.add(_rel)
+            _sub = os.path.dirname(_rel)
+            _dest = f'{QT_PLUGIN_DST}/{_sub}' if _sub else QT_PLUGIN_DST
+            if _f.suffix in ('.dylib', '.so'):
+                a.binaries.append((_dest, str(_f), 'BINARY'))
+            else:
+                a.datas.append((_dest, str(_f), 'DATA'))
+    print(f'[spec] 兜底补入 {len(_seen)} 个插件文件')
+else:
+    print('[spec] cocoa 插件已由 hook 收集，跳过兜底')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 构建期守卫 2/2：只允许**一套** Qt
+#
+# 判据（对应两次崩溃）：
+#   · 发行版数 > 1        -> 两套 Qt（pip wheel 在 /PySide6/Qt/ 下，conda 在
+#                            Frameworks/ 根或 lib/ 下）→ SIGABRT / 随机崩
+#   · 同名组件落在 >1 个 dest -> 同一个 Qt 装了两遍 → ObjC 类重复注册
+#     例如 libQt6Core.6.dylib（conda）与 QtCore.framework/...（wheel）并存。
+# ════════════════════════════════════════════════════════════════════════════
+_QT_FW_RE = re.compile(r'(?:^|/)Qt[A-Za-z0-9_]*\.framework/')
+
+
+def _qt_audit(tocs):
+    families = set()
+    dests_by_key = {}
+    for toc in tocs:
+        for entry in toc:
+            dest = '/' + str(entry[0]).replace('\\', '/').lstrip('/')
+            base = dest.rsplit('/', 1)[-1]
+            is_lib = base.startswith('libQt6') and base.endswith('.dylib')
+            is_fw = bool(_QT_FW_RE.search(dest))
+            if not (is_lib or is_fw):
+                continue
+            families.add('wheel' if '/PySide6/Qt/' in dest else 'conda')
+            key = base if is_lib else dest.split('.framework/')[0].rsplit('/', 1)[-1] + '.framework'
+            dests_by_key.setdefault(key, []).append(dest)
+    dupes = {k: sorted(set(v)) for k, v in dests_by_key.items() if len(set(v)) > 1}
+    return sorted(families), dupes
+
+
+_families, _dupes = _qt_audit([a.binaries, a.datas])
+print(f'[spec] Qt 发行版: {_families}')
+if _dupes:
+    print(f'[spec] Qt 重复组件: {list(_dupes.items())[:8]}')
+
+_FIX_HINT = (
+    '\n'
+    '──────────────────────────────────────────────────────────────────────\n'
+    'Qt 只能有一个来源，但当前构建检测到多套/重复：\n'
+    f'  发行版      : {_families}\n'
+    f'  重复组件    : {list(_dupes)[:8]}\n'
+    '\n'
+    'CI（.github/workflows/macos.yml）必须是：\n'
+    '  conda install -y -c conda-forge vtk pyside6     # Qt 统一到 conda-forge\n'
+    '  pip install --no-deps PyCt6                     # 不能让它把 wheel 版 PySide6 拉回来\n'
+    '  # 绝不要再 pip install PySide6\n'
+    '本地构建同理：先把 pip 的 PySide6 / PyQt 卸干净再打包。\n'
+    '背景见 ssd_vr_viewer_macos.spec 顶部与 tools/verify_macos_bundle.sh。\n'
+    '──────────────────────────────────────────────────────────────────────\n'
+)
+if len(_families) > 1:
+    raise SystemExit('[spec] FAIL: 检测到两套 Qt 发行版 ' + str(_families) + _FIX_HINT)
+if _dupes:
+    raise SystemExit('[spec] FAIL: 同一个 Qt 组件被装了两遍 ' + str(list(_dupes)[:8]) + _FIX_HINT)
+
+# 去重兜底（万一 hook 与 collect_all 撞了同一 dest，保留第一个）
 try:
     from PyInstaller.building.datastruct import TOC
 
@@ -201,7 +225,7 @@ try:
 
     a.binaries = _dedupe(a.binaries)
     a.datas = _dedupe(a.datas)
-except Exception as _e:  # pragma: no cover - 只影响噪音，不影响可用性
+except Exception as _e:  # pragma: no cover
     print(f'[spec] dedupe skipped: {_e}')
 
 pyz = PYZ(a.pure)
@@ -242,7 +266,7 @@ app = BUNDLE(
     bundle_identifier='com.ssdvr.fusion-viewer',
     info_plist={
         'NSHighResolutionCapable': True,
-        # 注意：LSEnvironment 里不放 @executable_path（LaunchServices 不展开它）。
-        # 插件路径由 Resources/qt.conf + ssd_vr_viewer._setup_macos_qt_paths() 兜底。
+        # 不放 LSEnvironment：LaunchServices 不会展开 @executable_path。
+        # 插件路径由 PySide6 自带的 qt.conf + ssd_vr_viewer._setup_macos_qt_paths() 兜底。
     },
 )
