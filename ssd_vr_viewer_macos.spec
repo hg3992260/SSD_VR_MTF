@@ -156,19 +156,48 @@ else:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 构建期守卫 2/2：只允许**一套** Qt
+# 构建期守卫：只允许**一套** Qt
 #
-# 判据（对应两次崩溃）：
-#   · 发行版数 > 1        -> 两套 Qt（pip wheel 在 /PySide6/Qt/ 下，conda 在
-#                            Frameworks/ 根或 lib/ 下）→ SIGABRT / 随机崩
-#   · 同名组件落在 >1 个 dest -> 同一个 Qt 装了两遍 → ObjC 类重复注册
-#     例如 libQt6Core.6.dylib（conda）与 QtCore.framework/...（wheel）并存。
+# 判据（对应两次崩溃，全部只用确定性证据，不用文件名猜）：
+#   ① PySide6 必须来自 conda —— `$CONDA_PREFIX/conda-meta/pyside6-*.json` 存在。
+#      conda 装的包也会出现在 `pip list` 里，所以**不能用 pip list 判断**！
+#      （2026-09-17 CI 就因为这条误判把已经修好的构建拦下来了。）
+#   ② PySide6 包内不应出现 Qt*.framework —— 那是 pip wheel 的特征
+#      （conda-forge 的 pyside6 实测 framework 数为 0）。
+#   ③ 同一个 Qt 组件不应落在两个 dest（CONDA_PREFIX/lib 的裸库 vs 包内 Qt 库），
+#      这正是 "Class QMetalLayer is implemented in both ..." 的来源。
 # ════════════════════════════════════════════════════════════════════════════
 _QT_FW_RE = re.compile(r'(?:^|/)Qt[A-Za-z0-9_]*\.framework/')
 
 
-def _qt_audit(tocs):
-    families = set()
+def _qt_provider_problems(prefix=None, pyside6_root=None):
+    """返回问题列表（空 = 只有一套 Qt 且来源正确）。参数可注入，便于单元测试。"""
+    problems = []
+    if prefix is None:
+        prefix = os.environ.get('CONDA_PREFIX') or os.environ.get('PREFIX') or sys.prefix
+    meta = Path(prefix) / 'conda-meta'
+    has_pyside6 = bool(list(meta.glob('pyside6-*.json'))) if meta.is_dir() else False
+    if not has_pyside6:
+        problems.append(
+            f'PySide6 不是 conda 装的（{meta} 下没有 pyside6-*.json）'
+            ' → 会和 conda 的 vtk/Qt 混装')
+
+    if pyside6_root is None:
+        try:
+            import PySide6  # noqa: PLC0415
+            pyside6_root = Path(PySide6.__path__[0])
+        except Exception:
+            pyside6_root = None
+    fw = []
+    if pyside6_root is not None and Path(pyside6_root).is_dir():
+        fw = list(Path(pyside6_root).rglob('Qt*.framework'))
+    if fw:
+        problems.append(f'PySide6 内含 Qt framework（pip wheel 特征）: {[str(p) for p in fw[:2]]}')
+    return problems
+
+
+def _qt_dupes(tocs):
+    """同一个 Qt 组件落在多个 dest 的情况（key -> [dest, ...]）。"""
     dests_by_key = {}
     for toc in tocs:
         for entry in toc:
@@ -178,7 +207,6 @@ def _qt_audit(tocs):
             is_fw = bool(_QT_FW_RE.search(dest))
             if not (is_lib or is_fw):
                 continue
-            families.add('wheel' if '/PySide6/Qt/' in dest else 'conda')
             if is_lib:
                 key, what = base, dest
             else:
@@ -188,34 +216,53 @@ def _qt_audit(tocs):
                 root = dest.split('.framework', 1)[0] + '.framework'
                 key, what = root.rsplit('/', 1)[-1], root
             dests_by_key.setdefault(key, []).append(what)
-    dupes = {k: sorted(set(v)) for k, v in dests_by_key.items() if len(set(v)) > 1}
-    return sorted(families), dupes
+    return {k: sorted(set(v)) for k, v in dests_by_key.items() if len(set(v)) > 1}
 
 
-_families, _dupes = _qt_audit([a.binaries, a.datas])
-print(f'[spec] Qt 发行版: {_families}')
+def _qt_counts(tocs):
+    naked, wheel_dir, fw = 0, 0, 0
+    for toc in tocs:
+        for entry in toc:
+            dest = '/' + str(entry[0]).replace('\\', '/').lstrip('/')
+            base = dest.rsplit('/', 1)[-1]
+            if not (base.startswith('libQt6') and base.endswith('.dylib')):
+                continue
+            if '/PySide6/Qt/' in dest:
+                wheel_dir += 1
+            else:
+                naked += 1
+    return {'naked': naked, 'under_PySide6_Qt': wheel_dir}
+
+
+_provider_problems = _qt_provider_problems()
+_counts = _qt_counts([a.binaries, a.datas])
+_dupes = _qt_dupes([a.binaries, a.datas])
+print(f'[spec] Qt 计数: {_counts}')
+print(f'[spec] PySide6 来源问题: {_provider_problems or "无"}')
 if _dupes:
     print(f'[spec] Qt 重复组件: {list(_dupes.items())[:8]}')
 
 _FIX_HINT = (
     '\n'
     '──────────────────────────────────────────────────────────────────────\n'
-    'Qt 只能有一个来源，但当前构建检测到多套/重复：\n'
-    f'  发行版      : {_families}\n'
-    f'  重复组件    : {list(_dupes)[:8]}\n'
+    'Qt 只能有一个来源，但当前构建检测到问题：\n'
+    f'  来源问题 : {_provider_problems}\n'
+    f'  重复组件 : {list(_dupes)[:8]}\n'
     '\n'
     'CI（.github/workflows/macos.yml）必须是：\n'
-    '  conda install -y -c conda-forge vtk pyside6     # Qt 统一到 conda-forge\n'
+    '  conda install -y -c conda-forge numpy scipy matplotlib vtk pyside6\n'
     '  pip install --no-deps PyCt6                     # 不能让它把 wheel 版 PySide6 拉回来\n'
-    '  # 绝不要再 pip install PySide6\n'
+    '  # 绝不要再 pip install PySide6；注意 pip list 里能看见 conda 装的包，'
+    '不能用它判断来源\n'
     '本地构建同理：先把 pip 的 PySide6 / PyQt 卸干净再打包。\n'
-    '背景见 ssd_vr_viewer_macos.spec 顶部与 tools/verify_macos_bundle.sh。\n'
+    '背景见本文件顶部与 tools/verify_macos_bundle.sh。\n'
     '──────────────────────────────────────────────────────────────────────\n'
 )
-if len(_families) > 1:
-    raise SystemExit('[spec] FAIL: 检测到两套 Qt 发行版 ' + str(_families) + _FIX_HINT)
+if _provider_problems:
+    raise SystemExit('[spec] FAIL: Qt 来源不唯一 ' + str(_provider_problems) + _FIX_HINT)
 if _dupes:
     raise SystemExit('[spec] FAIL: 同一个 Qt 组件被装了两遍 ' + str(list(_dupes)[:8]) + _FIX_HINT)
+print('[spec] OK: 只有一套 Qt（conda-forge），无重复组件')
 
 # 去重兜底（万一 hook 与 collect_all 撞了同一 dest，保留第一个）
 try:
